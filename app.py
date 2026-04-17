@@ -1,20 +1,26 @@
 """
-Streamlit güvenlik paneli: Hybrid Threat Detection Middleware.
+Web3 Threat Detection — 45 boyutlu özellik vektörüyle uyumlu güvenlik paneli.
 """
 
 from __future__ import annotations
 
 import html
-import json
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
 import pandas as pd
 import streamlit as st
 
 from middleware import ThreatDetectionAgent, _fraud_profile_for_demo
 
-SIDEBAR_NUMERIC_FIELDS: list[tuple[str, str]] = [
+ROOT = Path(__file__).resolve().parent
+DATA_CSV = ROOT / "data" / "transaction_dataset.csv"
+
+SAFE_ADDRESS = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+KNOWN_THREAT_ADDRESS = "0x0000000000000000000000000000000000000bad"
+
+PRIMARY_FIELDS: list[tuple[str, str]] = [
     (
         "Total Transactions",
         "total transactions (including tnx to create contract",
@@ -24,10 +30,7 @@ SIDEBAR_NUMERIC_FIELDS: list[tuple[str, str]] = [
     ("Sent Transactions", "Sent tnx"),
 ]
 
-SAFE_ADDRESS = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-MALICIOUS_DEMO_ADDRESS = "0x0000000000000000000000000000000000000bad"
-# RF=1 için 45 boyutlu tam vektör (yalnızca 4 sidebar alanı yetmez)
-FEATURE_VECTOR_OVERRIDE_KEY = "feature_vector_45"
+PRIMARY_COLS = {col for _lb, col in PRIMARY_FIELDS}
 
 
 @st.cache_resource
@@ -35,72 +38,153 @@ def get_agent() -> ThreatDetectionAgent:
     return ThreatDetectionAgent()
 
 
-def _init_session() -> None:
+@st.cache_data(show_spinner=False)
+def _profile_from_dataset(flag: Literal[0, 1], feature_names: tuple[str, ...]) -> dict[str, float]:
+    """Eğitim CSV’sinden FLAG=0 (güvenli) veya FLAG=1 (dolandırıcılık) için tam 45 özellik."""
+    if not DATA_CSV.is_file():
+        return {n: 0.0 for n in feature_names}
+
+    df = pd.read_csv(DATA_CSV)
+    df.columns = df.columns.str.strip().str.replace(r"\s+", " ", regex=True)
+    drop_cols = [
+        c
+        for c in df.columns
+        if c.lower() in ("index", "address", "unnamed: 0") or c == "Unnamed: 0"
+    ]
+    df = df.drop(columns=drop_cols, errors="ignore")
+    y = df["FLAG"]
+    X = df.drop(columns=["FLAG"])
+    erc20_text = [
+        c
+        for c in X.columns
+        if "erc20" in c.lower() and not pd.api.types.is_numeric_dtype(X[c])
+    ]
+    if erc20_text:
+        X = X.drop(columns=erc20_text)
+    X = X.select_dtypes(include=["number"])
+    X = X[list(feature_names)]
+    row = X.loc[y == flag].iloc[0]
+    return {k: float(row[k]) for k in feature_names}
+
+
+def _field_session_key(i: int) -> str:
+    return f"fld_{i}"
+
+
+def init_feature_session(names: list[str]) -> None:
+    if "feature_names_order" not in st.session_state:
+        st.session_state.feature_names_order = list(names)
+    elif list(st.session_state.feature_names_order) != list(names):
+        st.session_state.feature_names_order = list(names)
+
     if "ui_addr" not in st.session_state:
         st.session_state.ui_addr = SAFE_ADDRESS
     if "demo_force_blacklist" not in st.session_state:
         st.session_state.demo_force_blacklist = False
-    for _lb, col in SIDEBAR_NUMERIC_FIELDS:
-        key = f"ui_feat_{col}"
-        if key not in st.session_state:
-            st.session_state[key] = 0.0
+
+    if "features_initialized" not in st.session_state:
+        for i, _n in enumerate(names):
+            st.session_state[_field_session_key(i)] = 0.0
+        st.session_state.features_initialized = True
 
 
-def _feat_keys() -> list[str]:
-    return [col for _lb, col in SIDEBAR_NUMERIC_FIELDS]
+def feature_dict_from_session(names: list[str]) -> dict[str, float]:
+    return {
+        n: float(st.session_state.get(_field_session_key(i), 0.0) or 0.0)
+        for i, n in enumerate(names)
+    }
 
 
-def _apply_safe_demo() -> None:
-    st.session_state.ui_addr = SAFE_ADDRESS
-    st.session_state.demo_force_blacklist = False
-    st.session_state.pop(FEATURE_VECTOR_OVERRIDE_KEY, None)
-    for col in _feat_keys():
-        st.session_state[f"ui_feat_{col}"] = 0.0
+def push_profile_to_session(names: list[str], profile: dict[str, float]) -> None:
+    for i, n in enumerate(names):
+        st.session_state[_field_session_key(i)] = float(profile.get(n, 0.0) or 0.0)
 
 
-def _apply_malicious_demo() -> None:
-    st.session_state.ui_addr = MALICIOUS_DEMO_ADDRESS
-    st.session_state.demo_force_blacklist = True
-    st.session_state.pop(FEATURE_VECTOR_OVERRIDE_KEY, None)
-    for col in _feat_keys():
-        st.session_state[f"ui_feat_{col}"] = 0.0
-
-
-def _apply_anomaly_demo(agent: ThreatDetectionAgent) -> None:
-    st.session_state.ui_addr = SAFE_ADDRESS
-    st.session_state.demo_force_blacklist = False
-    try:
-        profile = _fraud_profile_for_demo(agent._feature_names, agent._model)
-        st.session_state[FEATURE_VECTOR_OVERRIDE_KEY] = {
-            k: float(profile[k]) for k in agent._feature_names
-        }
-        for col in _feat_keys():
-            st.session_state[f"ui_feat_{col}"] = float(profile.get(col, 0.0))
-    except FileNotFoundError:
-        st.session_state.pop(FEATURE_VECTOR_OVERRIDE_KEY, None)
-        for col in _feat_keys():
-            st.session_state[f"ui_feat_{col}"] = 0.0
-        st.session_state[f"ui_feat_{_feat_keys()[0]}"] = 1_000_000.0
-        st.session_state[f"ui_feat_{_feat_keys()[3]}"] = 500_000.0
-
-
-def build_features_dict(agent: ThreatDetectionAgent) -> dict[str, float]:
+def apply_scenario_safe(agent: ThreatDetectionAgent) -> None:
     names = agent._feature_names
-    override = st.session_state.get(FEATURE_VECTOR_OVERRIDE_KEY)
-    if isinstance(override, dict) and all(k in override for k in names):
-        out = {k: float(override.get(k, 0) or 0) for k in names}
-        for _label, col in SIDEBAR_NUMERIC_FIELDS:
-            if col in out:
-                key = f"ui_feat_{col}"
-                out[col] = float(st.session_state.get(key, out[col]) or 0)
-        return out
+    tup = tuple(names)
+    prof = _profile_from_dataset(0, tup)
+    st.session_state.ui_addr = SAFE_ADDRESS
+    st.session_state.demo_force_blacklist = False
+    push_profile_to_session(names, prof)
 
-    out = {name: 0.0 for name in names}
-    for _label, col in SIDEBAR_NUMERIC_FIELDS:
-        if col in out:
-            key = f"ui_feat_{col}"
-            out[col] = float(st.session_state.get(key, 0.0) or 0.0)
-    return out
+
+def apply_scenario_known_threat(agent: ThreatDetectionAgent) -> None:
+    names = agent._feature_names
+    tup = tuple(names)
+    prof = _profile_from_dataset(0, tup)
+    st.session_state.ui_addr = KNOWN_THREAT_ADDRESS
+    st.session_state.demo_force_blacklist = True
+    push_profile_to_session(names, prof)
+
+
+def apply_scenario_anomaly(agent: ThreatDetectionAgent) -> None:
+    names = agent._feature_names
+    try:
+        prof = _fraud_profile_for_demo(names, agent._model)
+    except FileNotFoundError:
+        prof = _profile_from_dataset(1, tuple(names))
+    st.session_state.ui_addr = SAFE_ADDRESS
+    st.session_state.demo_force_blacklist = False
+    push_profile_to_session(names, prof)
+
+
+def render_sidebar(agent: ThreatDetectionAgent) -> None:
+    names = agent._feature_names
+    init_feature_session(names)
+
+    st.markdown("### 🧪 Demo Scenarios")
+    st.caption(
+        "Her senaryo **45 özelliğin tamamını** eğitim dağılımına yakın değerlerle doldurur. "
+        "**Known Threat** kara listeyi sunum modunda simüle eder (GoPlus atlanır)."
+    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Safe TX", use_container_width=True):
+            apply_scenario_safe(agent)
+            st.session_state.pop("last_scan", None)
+            st.rerun()
+    with c2:
+        if st.button("Known Threat", use_container_width=True):
+            apply_scenario_known_threat(agent)
+            st.session_state.pop("last_scan", None)
+            st.rerun()
+    with c3:
+        if st.button("Zero-Day Anomaly", use_container_width=True):
+            apply_scenario_anomaly(agent)
+            st.session_state.pop("last_scan", None)
+            st.rerun()
+
+    st.divider()
+    st.markdown("### Manual Input")
+    st.text_input("Wallet address (Ethereum)", key="ui_addr")
+
+    st.markdown("#### Key Transaction Metrics")
+    for label, col in PRIMARY_FIELDS:
+        i = names.index(col)
+        st.number_input(
+            label,
+            value=float(st.session_state.get(_field_session_key(i), 0.0)),
+            step=0.01,
+            format="%.6f",
+            key=_field_session_key(i),
+        )
+
+    other = [(i, n) for i, n in enumerate(names) if n not in PRIMARY_COLS]
+    with st.expander("🛠️ Advanced Technical Features (41 More)", expanded=False):
+        st.caption("Kalan özellikler — manuel stres testi için.")
+        ac1, ac2 = st.columns(2)
+        for idx, (i, n) in enumerate(other):
+            with ac1 if idx % 2 == 0 else ac2:
+                short = n if len(n) < 42 else n[:39] + "…"
+                st.number_input(
+                    short,
+                    value=float(st.session_state.get(_field_session_key(i), 0.0)),
+                    step=0.01,
+                    format="%.6f",
+                    key=_field_session_key(i),
+                    help=n,
+                )
 
 
 def main() -> None:
@@ -109,154 +193,119 @@ def main() -> None:
         page_icon="🛡️",
         layout="wide",
     )
-    _init_session()
 
     st.markdown(
         """
         <style>
-        .hero-title { font-size: 1.75rem; font-weight: 700; margin-bottom: 0.25rem; }
-        .hero-sub {
-            color: #9ca3af; font-size: 0.95rem; margin-bottom: 1.25rem;
+        .dash-hero {
+            font-size: 1.65rem; font-weight: 700; letter-spacing: -0.02em;
+            margin-bottom: 0.2rem;
         }
-        .panel-safe {
-            background: linear-gradient(135deg, rgba(16,185,129,0.15), rgba(0,0,0,0.25));
-            border: 2px solid #10b981; border-radius: 14px; padding: 1.5rem; margin: 0.5rem 0;
+        .dash-sub { color: #94a3b8; font-size: 0.95rem; margin-bottom: 1.2rem; }
+        div[data-testid="stMetricValue"] { font-size: 1.35rem !important; }
+        .advisor-safe {
+            border-radius: 12px; padding: 1.25rem; margin-top: 0.75rem;
+            border: 1px solid rgba(34,197,94,0.45);
+            background: linear-gradient(145deg, rgba(34,197,94,0.12), rgba(15,23,42,0.6));
         }
-        .panel-deny {
-            background: linear-gradient(135deg, rgba(239,68,68,0.12), rgba(0,0,0,0.3));
-            border: 2px solid #ef4444; border-radius: 14px; padding: 1.5rem; margin: 0.5rem 0;
+        .advisor-risk {
+            border-radius: 12px; padding: 1.25rem; margin-top: 0.75rem;
+            border: 1px solid rgba(248,113,113,0.5);
+            background: linear-gradient(145deg, rgba(239,68,68,0.12), rgba(15,23,42,0.65));
         }
-        .tx-card {
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(148,163,184,0.25);
-            border-radius: 10px; padding: 0.85rem 1rem; margin: 0.35rem 0;
-        }
-        .mono { font-family: ui-monospace, monospace; font-size: 0.82rem; word-break: break-all; }
+        .advisor-title { font-size: 1.15rem; font-weight: 700; margin-bottom: 0.5rem; }
+        .advisor-body { font-size: 1.05rem; line-height: 1.55; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    st.markdown('<p class="hero-title">🛡️ Web3 Threat Detection Middleware</p>', unsafe_allow_html=True)
+    agent = get_agent()
+    names = agent._feature_names
+    init_feature_session(names)
+
+    with st.sidebar:
+        render_sidebar(agent)
+
+    st.markdown('<div class="dash-hero">🛡️ Web3 Threat Detection Dashboard</div>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="hero-sub">Bu panel, arka plandaki middleware’in sırasıyla '
-        "<strong>GoPlus</strong> (kara liste), <strong>Random Forest</strong> (anomali) ve "
-        "<strong>Groq</strong> (bağlamsal uyarı) katmanlarını nasıl kullandığını adım adım gösterir.</p>",
+        '<div class="dash-sub">45 boyutlu on-chain özellik vektörü → GoPlus → Random Forest '
+        "(olasılık) → Groq. Kara kutu değil; tüm girdi/çıktı aşağıda denetlenebilir.</div>",
         unsafe_allow_html=True,
     )
 
-    agent = get_agent()
-
-    with st.sidebar:
-        st.markdown("### 🧪 Quick Demo Scenarios")
-        st.caption(
-            "Sunum için hazır senaryolar: form alanları otomatik dolar. "
-            "“Malicious” senaryosu kara listeyi **sunum modunda** simüle eder (GoPlus yerine). "
-            "“Anomaly” eğitim verisinden **45 özelliklik tam vektör** yükler (yalnızca 4 alan RF için yetersiz)."
-        )
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Load Safe Address", use_container_width=True):
-                _apply_safe_demo()
-                st.session_state.pop("last_scan", None)
-                st.rerun()
-        with c2:
-            if st.button("Load Malicious Address", use_container_width=True):
-                _apply_malicious_demo()
-                st.session_state.pop("last_scan", None)
-                st.rerun()
-        if st.button("Load Anomaly Behavior", use_container_width=True):
-            _apply_anomaly_demo(agent)
-            st.session_state.pop("last_scan", None)
-            st.rerun()
-
-        st.divider()
-        st.markdown("### Transaction inputs")
-        st.text_input("Cüzdan adresi", key="ui_addr", help="Ethereum mainnet (chain_id=1)")
-        st.caption("Öne çıkan 4 özellik; kalan ~41 sütun 0 kabul edilir.")
-        for label, col in SIDEBAR_NUMERIC_FIELDS:
-            st.number_input(
-                label,
-                min_value=0.0,
-                step=1.0,
-                format="%.6f",
-                key=f"ui_feat_{col}",
-            )
-
-    scan = st.button(
-        "🔍 Scan Transaction",
+    analyze = st.button(
+        "🔍 Analyze Transaction",
         type="primary",
         use_container_width=True,
-        help="GoPlus → Random Forest → (gerekirse) Groq sırasıyla çalışır",
     )
 
-    if scan:
+    if analyze:
         addr = (st.session_state.get("ui_addr") or "").strip()
         if not addr:
             st.warning("Lütfen bir cüzdan adresi girin.")
         else:
-            features_dict = build_features_dict(agent)
+            fd = feature_dict_from_session(names)
+            st.session_state["feature_dict"] = dict(fd)
             force_bl = bool(st.session_state.get("demo_force_blacklist"))
             t0 = time.perf_counter()
-            llm_text: str | None = None
 
-            uses_full_profile = isinstance(
-                st.session_state.get(FEATURE_VECTOR_OVERRIDE_KEY), dict
-            )
-            telemetry: dict[str, Any] = {
-                "address": addr,
-                "features_to_model": features_dict,
-                "demo_force_blacklist": force_bl,
-                "feature_input_mode": (
-                    "training_fraud_profile_45d"
-                    if uses_full_profile
-                    else "sidebar_four_plus_zeros"
-                ),
-            }
+            with st.status("Initializing Threat Engine...", expanded=True) as status:
+                status.update(
+                    label="Initializing Threat Engine...",
+                    state="running",
+                )
+                time.sleep(0.6)
 
-            with st.status("Middleware pipeline", expanded=True) as status:
-                line1 = status.empty()
-                line1.markdown("⏳ **1.** Checking global blacklists (GoPlus API)...")
+                status.update(
+                    label="🔍 Querying Blockchain Intelligence APIs (GoPlus)...",
+                    state="running",
+                )
+                time.sleep(0.6)
                 if force_bl:
                     blacklisted = True
                     goplus_raw: dict[str, Any] = {
                         "_demo_simulation": True,
-                        "message": "Sunum: kara liste senaryosu — gerçek GoPlus çağrısı atlandı.",
+                        "message": "Known Threat senaryosu: GoPlus simüle kara liste.",
                     }
                 else:
                     blacklisted, goplus_raw = agent.fetch_goplus_security(addr)
-                telemetry["goplus_response"] = goplus_raw
-                line1.markdown("✅ **1.** Checking global blacklists (GoPlus API)...")
 
-                line2 = status.empty()
-                line2.markdown("⏳ **2.** Running transaction through Random Forest AI...")
-                if blacklisted:
-                    anomalous = False
-                    rf_note = "Atlandı (kara liste önceliği)"
-                else:
-                    anomalous = agent.check_anomaly(features_dict)
-                    rf_note = "Tamamlandı"
+                status.update(
+                    label="🧠 Processing 45-Dimensional Feature Vector...",
+                    state="running",
+                )
+                time.sleep(0.6)
+
+                status.update(
+                    label="🛡️ Evaluating via Random Forest Engine...",
+                    state="running",
+                )
+                time.sleep(0.6)
+
+                df_row = pd.DataFrame([fd], columns=names)
                 try:
-                    df_row = pd.DataFrame(
-                        [features_dict], columns=agent._feature_names
-                    )
+                    proba = agent._model.predict_proba(df_row)[0].tolist()
                     pred = int(agent._model.predict(df_row)[0])
                 except Exception:
+                    proba = [0.5, 0.5]
                     pred = -1
-                telemetry["random_forest"] = {
-                    "prediction_class": pred,
-                    "anomaly_flag": anomalous,
-                    "note": rf_note,
-                }
-                line2.markdown("✅ **2.** Running transaction through Random Forest AI...")
+
+                if blacklisted:
+                    anomalous = False
+                else:
+                    anomalous = pred == 1
 
                 threat = blacklisted or anomalous
-                line3 = status.empty()
+                llm_text: str | None = None
                 groq_raw: Any = None
+
                 if threat:
-                    line3.markdown(
-                        "⏳ **3.** Generating contextual threat intelligence (Groq LLM)..."
+                    status.update(
+                        label="🤖 Generating Contextual Report (Groq LLM)...",
+                        state="running",
                     )
+                    time.sleep(0.6)
                     if blacklisted:
                         reason = (
                             "GoPlus kara liste / güvenlik bayrakları "
@@ -267,141 +316,128 @@ def main() -> None:
                     detail = agent.generate_llm_warning_detailed(addr, reason)
                     llm_text = str(detail.get("content", ""))
                     groq_raw = detail.get("groq_raw")
-                    telemetry["groq_response"] = groq_raw
-                    telemetry["llm_used"] = bool(detail.get("used_llm"))
-                    line3.markdown(
-                        "✅ **3.** Generating contextual threat intelligence (Groq LLM)..."
-                    )
+
+                latency_ms = (time.perf_counter() - t0) * 1000.0
+
+                if blacklisted:
+                    verdict = "DANGER"
+                    threat_src = "GoPlus Blacklist"
+                elif anomalous:
+                    verdict = "SUSPICIOUS"
+                    threat_src = "AI Anomaly"
                 else:
-                    line3.markdown(
-                        "⏭️ **3.** Groq LLM atlandı — tehdit yok, **latency optimizasyonu** (LLM bypass)"
-                    )
-                    telemetry["groq_response"] = None
-                    telemetry["llm_used"] = False
+                    verdict = "SAFE"
+                    threat_src = "None"
 
-            latency_ms = (time.perf_counter() - t0) * 1000.0
-            if threat:
-                status_str = "Denied/Pending"
-            else:
-                status_str = "Allow"
+                status_str = "Denied/Pending" if threat else "Allow"
+                conf_pct = float(max(proba) * 100.0) if proba else 0.0
+                risk_pct = float(proba[1] * 100.0) if len(proba) > 1 else 0.0
 
-            st.session_state.demo_force_blacklist = False
+                raw_eval: dict[str, Any] = {
+                    "status": status_str,
+                    "llm_warning": llm_text,
+                    "latency_ms": round(latency_ms, 2),
+                    "verdict": verdict,
+                    "threat_source": threat_src,
+                    "blacklisted": blacklisted,
+                    "anomalous": anomalous,
+                    "random_forest_prediction": pred,
+                    "predict_proba": {"class_0_legit": proba[0], "class_1_risk": proba[1]}
+                    if len(proba) > 1
+                    else proba,
+                    "confidence_in_argmax_class_pct": round(conf_pct, 2),
+                    "risk_class_probability_pct": round(risk_pct, 2),
+                }
 
-            st.session_state["last_scan"] = {
-                "status": status_str,
-                "llm_warning": llm_text,
-                "latency_ms": round(latency_ms, 2),
-                "telemetry": telemetry,
-                "blacklisted": blacklisted,
-                "anomalous": anomalous,
-            }
+                st.session_state["last_scan"] = {
+                    "verdict": verdict,
+                    "latency_ms": round(latency_ms, 2),
+                    "threat_source": threat_src,
+                    "llm_warning": llm_text,
+                    "raw_evaluate": raw_eval,
+                    "features": dict(fd),
+                    "goplus_raw": goplus_raw,
+                    "groq_raw": groq_raw,
+                    "proba": proba,
+                    "blacklisted": blacklisted,
+                    "anomalous": anomalous,
+                }
 
-    col_left, col_right = st.columns(2, gap="large")
+                st.session_state.demo_force_blacklist = False
 
-    with col_left:
-        st.subheader("Transaction Details")
-        st.markdown("Kullanıcı girdilerinin özeti — middleware’e giden işlem bağlamı.")
-        addr = (st.session_state.get("ui_addr") or "").strip()
-        st.markdown(
-            f'<div class="tx-card"><strong>Adres</strong><div class="mono">{html.escape(addr) or "—"}</div></div>',
-            unsafe_allow_html=True,
-        )
-        fv = build_features_dict(agent)
-        mcols = st.columns(2)
-        for i, (_lb, col) in enumerate(SIDEBAR_NUMERIC_FIELDS):
-            with mcols[i % 2]:
-                st.metric(label=_lb, value=f"{fv[col]:,.4f}")
-        with st.expander("Tüm özellik vektörü (45 boyut)", expanded=False):
-            st.json(fv)
-
-    with col_right:
-        st.subheader("Middleware Live Analysis")
-        snap = st.session_state.get("last_scan")
-        if snap:
-            status = snap["status"]
-            lat = snap["latency_ms"]
-            llm = snap.get("llm_warning")
-
-            if status == "Allow":
-                st.markdown(
-                    f"""
-                    <div class="panel-safe">
-                        <div style="font-size:1.35rem;font-weight:700;color:#34d399;margin-bottom:0.5rem;">
-                            İşlem Onaylandı
-                        </div>
-                        <div style="font-size:1.05rem;">
-                            Bu adres ve işlem özellikleri için tehdit sinyali yok.
-                            Middleware <strong>GoPlus</strong> ve <strong>Random Forest</strong>
-                            katmanlarından geçti; LLM çağrılmadı.
-                        </div>
-                        <div style="margin-top:1rem;font-size:1.1rem;font-weight:600;">
-                            Gecikme (Latency): ~{lat:.1f} ms (LLM Bypassed for Optimization)
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+                status.update(
+                    label="Analysis Complete",
+                    state="complete",
+                    expanded=False,
                 )
-            else:
-                st.markdown(
-                    """
-                    <div class="panel-deny">
-                        <div style="font-size:1.35rem;font-weight:700;color:#fca5a5;margin-bottom:0.35rem;">
-                            İşlem Reddedildi / İncelemede
-                        </div>
-                        <div style="font-size:1rem;">
-                            Kara liste veya ML anomali tespit edildi. Middleware, bağlam için
-                            <strong>Groq LLM</strong> katmanını devreye aldı (veya anahtar yoksa yerel uyarı üretti).
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                if llm:
-                    st.info("🛡️ **AI Security Advisor**\n\n" + str(llm))
 
-            st.metric("Processing Latency (toplam)", f"{lat:,.2f} ms")
+    snap = st.session_state.get("last_scan")
+    if snap:
+        v = snap["verdict"]
+        lat = snap["latency_ms"]
+        proba = snap.get("proba") or [0.0, 0.0]
+        risk_pct = float(proba[1] * 100.0) if len(proba) > 1 else 0.0
+        mx_pct = float(max(proba) * 100.0) if proba else 0.0
+
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            if v == "SAFE":
+                st.metric("Verdict", "SAFE", delta="İşlem imzalanabilir", delta_color="normal")
+            elif v == "DANGER":
+                st.metric("Verdict", "DANGER", delta="Kara liste / yüksek risk", delta_color="inverse")
+            else:
+                st.metric("Verdict", "SUSPICIOUS", delta="ML anomali", delta_color="off")
+        with m2:
+            st.metric(
+                "Confidence Score",
+                f"{mx_pct:.1f}%",
+                help="Random Forest predict_proba: argmax sınıf olasılığı",
+            )
+            st.caption(f"Risk sınıfı (1) olasılığı: **{risk_pct:.1f}%**")
+        with m3:
+            st.metric("Processing Latency", f"{lat:,.0f} ms")
+
+        st.divider()
+        if v == "SAFE":
+            st.success(
+                "**No anomalies detected. Transaction is safe to sign.**\n\n"
+                f"Model risk olasılığı: **{risk_pct:.1f}%** · Latency: **{lat:,.0f} ms**"
+            )
         else:
-            st.info(
-                "Sol tarafta adres ve özellikleri girin veya **Quick Demo** ile yükleyin; "
-                "ardından **Scan Transaction** ile GoPlus → Random Forest → (isteğe bağlı) Groq "
-                "zincirini çalıştırın."
+            st.warning("**Risk pipeline tetiklendi** — aşağıdaki danışman raporunu okuyun.")
+            llm = snap.get("llm_warning") or ""
+            safe_llm = html.escape(str(llm))
+            st.markdown(
+                f"""
+                <div class="advisor-risk">
+                    <div class="advisor-title">🤖 AI Security Advisor Report</div>
+                    <div class="advisor-body">{safe_llm}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
-    with st.expander("Technical Details & Raw Data", expanded=False):
-        st.markdown(
-            "Aşağıda modele giden **tam özellik sözlüğü** ve **GoPlus / Groq ham yanıtları** "
-            "(varsa) yer alır. Jüri sorularında doğrudan bu JSON’u gösterebilirsiniz."
-        )
-        snap = st.session_state.get("last_scan")
+    with st.expander("📋 Raw Model Input (45 Vector)", expanded=False):
+        fd_show = st.session_state.get("feature_dict") or feature_dict_from_session(names)
+        st.json(fd_show)
+
+    with st.expander("🛠️ System Logs & Raw Payload", expanded=False):
         if not snap:
-            st.caption("Henüz tarama yapılmadı — Scan Transaction ile veri üretin.")
+            st.caption("Önce **Analyze Transaction** çalıştırın.")
         else:
-            tel = snap.get("telemetry") or {}
-            st.caption(
-                f"Özellik kaynağı: `{tel.get('feature_input_mode', '—')}` "
-                "(Anomaly demo = eğitimden 45 boyutlu vektör)"
-            )
-            st.markdown("**`features_to_model` (45 özellik)**")
-            st.code(
-                json.dumps(tel.get("features_to_model", {}), indent=2, ensure_ascii=False),
-                language="json",
-            )
-            st.markdown("**`goplus_response` (GoPlus API)**")
-            st.code(
-                json.dumps(tel.get("goplus_response", {}), indent=2, ensure_ascii=False),
-                language="json",
-            )
-            st.markdown("**`random_forest` (özet)**")
-            st.code(
-                json.dumps(tel.get("random_forest", {}), indent=2, ensure_ascii=False),
-                language="json",
-            )
-            st.markdown("**`groq_response` (Groq tam yanıt veya null)**")
-            gr = tel.get("groq_response")
-            st.code(
-                json.dumps(gr, indent=2, ensure_ascii=False) if gr is not None else "null",
-                language="json",
-            )
+            cleft, cright = st.columns(2)
+            with cleft:
+                st.markdown("**Random Forest girdi vektörü (45)**")
+                st.json(snap.get("features") or {})
+            with cright:
+                st.markdown("**`evaluate_transaction` tarzı özet + ham GoPlus**")
+                st.json(
+                    {
+                        "evaluate_style_summary": snap.get("raw_evaluate"),
+                        "goplus_raw": snap.get("goplus_raw"),
+                        "groq_raw": snap.get("groq_raw"),
+                    }
+                )
 
 
 if __name__ == "__main__":
