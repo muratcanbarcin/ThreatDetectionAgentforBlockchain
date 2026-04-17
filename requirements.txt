@@ -1,3 +1,6 @@
 pandas
 matplotlib
 scikit-learn
+groq
+requests
+python-dotenv

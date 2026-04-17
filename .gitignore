@@ -1,25 +1,64 @@
-# Environments
+# Ortam / sırlar
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Sanal ortamlar
 venv/
 env/
-.env
+.venv/
+ENV/
 
-# Python caching
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+*.manifest
+*.spec
 
-# OS generated files
+# Test / kalite
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+
+# ML çıktıları (train_model.py ile üretilir)
+*.pkl
+
+# Veri setleri (büyük dosyalar; repo dışında veya release ile sağlanabilir)
+data/*.csv
+data/*.parquet
+data/*.json
+!data/.gitkeep
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Günlükler
+*.log
+logs/
+
+# İşletim sistemi
 .DS_Store
 Thumbs.db
+Desktop.ini
 
-# IDEs
+# IDE
 .idea/
 .vscode/
 *.swp
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Logs
-*.log
+*.swo
+*~
