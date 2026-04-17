@@ -32,14 +32,17 @@ class ThreatDetectionAgent:
         api_key = os.environ.get("GROQ_API_KEY")
         self._groq: Groq | None = Groq(api_key=api_key) if api_key else None
 
-    def check_blacklist(self, address: str) -> bool:
+    def fetch_goplus_security(self, address: str) -> tuple[bool, dict[str, Any]]:
+        """GoPlus API tam JSON yanıtı ve kara liste kararı (UI / log için)."""
         url = GOPLUS_TEMPLATE.format(address=address)
         try:
             resp = requests.get(url, timeout=15)
             resp.raise_for_status()
             payload: dict[str, Any] = resp.json()
-        except (requests.RequestException, ValueError):
-            return False
+        except requests.RequestException as e:
+            return False, {"error": str(e), "source": "goplus_http"}
+        except ValueError as e:
+            return False, {"error": str(e), "source": "goplus_json"}
 
         result = payload.get("result") or {}
         flags = (
@@ -47,7 +50,12 @@ class ThreatDetectionAgent:
             result.get("malicious_behavior", "0"),
             result.get("stealing_attack", "0"),
         )
-        return any(str(v) == "1" for v in flags)
+        threat = any(str(v) == "1" for v in flags)
+        return threat, payload
+
+    def check_blacklist(self, address: str) -> bool:
+        threat, _payload = self.fetch_goplus_security(address)
+        return threat
 
     def check_anomaly(self, features_dict: dict[str, Any]) -> bool:
         row = {
@@ -58,7 +66,9 @@ class ThreatDetectionAgent:
         pred = int(self._model.predict(df)[0])
         return pred == 1
 
-    def generate_llm_warning(self, address: str, threat_reason: str) -> str:
+    def generate_llm_warning_detailed(
+        self, address: str, threat_reason: str
+    ) -> dict[str, Any]:
         prompt = (
             f"Şu cüzdan adresi ({address}) {threat_reason} nedeniyle riskli bulundu. "
             "Durumu değrlendir ve eğer riskli ise işlemi iptal etmesini söyleyen 2-3 cümlelik profesyonel bir "
@@ -74,10 +84,11 @@ class ThreatDetectionAgent:
         )
 
         if self._groq is None:
-            return (
+            text = (
                 "Uyarı: GROQ_API_KEY tanımlı değil; LLM devre dışı. "
                 f"Adres {address} için {threat_reason} tespit edildi; işlemi iptal etmeniz önerilir."
             )
+            return {"content": text, "groq_raw": None, "used_llm": False}
 
         try:
             completion = self._groq.chat.completions.create(
@@ -86,12 +97,22 @@ class ThreatDetectionAgent:
                 temperature=0.4,
             )
             msg = completion.choices[0].message
-            return (msg.content or "").strip()
-        except Exception:
-            return (
+            text = (msg.content or "").strip()
+            raw = (
+                completion.model_dump()
+                if hasattr(completion, "model_dump")
+                else completion.dict()
+            )
+            return {"content": text, "groq_raw": raw, "used_llm": True}
+        except Exception as e:
+            text = (
                 "Uyarı: Groq çağrısı başarısız (ağ veya kota). "
                 f"Adres {address} için {threat_reason} tespit edildi; işlemi iptal etmeniz önerilir."
             )
+            return {"content": text, "groq_raw": {"error": str(e)}, "used_llm": False}
+
+    def generate_llm_warning(self, address: str, threat_reason: str) -> str:
+        return str(self.generate_llm_warning_detailed(address, threat_reason)["content"])
 
     def evaluate_transaction(
         self, address: str, features_dict: dict[str, Any]

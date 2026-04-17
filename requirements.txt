@@ -4,3 +4,4 @@ scikit-learn
 groq
 requests
 python-dotenv
+streamlit
