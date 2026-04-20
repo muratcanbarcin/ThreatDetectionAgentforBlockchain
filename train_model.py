@@ -1,6 +1,6 @@
 """
-Ethereum Fraud Detection veri seti ile Random Forest eğitimi (Faz 1).
-Çıktılar: rf_model.pkl (Pipeline: medyan imputation + RF), model_features.pkl (özellik sırası).
+Phase 1: train a Random Forest on the Ethereum fraud detection dataset.
+Outputs: rf_model.pkl (pipeline: median imputation + RF), model_features.pkl (feature order).
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ FEATURES_PATH = ROOT / "model_features.pkl"
 def load_and_clean_data(csv_path: Path) -> tuple[pd.DataFrame, pd.Series]:
     df = pd.read_csv(csv_path)
 
-    # Sütun adlarındaki gereksiz boşlukları temizle (ör. baştaki boşluk, çift boşluk)
+    # Normalize column names (leading/trailing/double spaces)
     df.columns = df.columns.str.strip().str.replace(r"\s+", " ", regex=True)
 
     drop_id_cols = []
@@ -36,12 +36,12 @@ def load_and_clean_data(csv_path: Path) -> tuple[pd.DataFrame, pd.Series]:
     df = df.drop(columns=drop_id_cols, errors="ignore")
 
     if "FLAG" not in df.columns:
-        raise KeyError("Hedef sütun 'FLAG' veri setinde bulunamadı.")
+        raise KeyError("Target column 'FLAG' not found in the dataset.")
 
     y = df["FLAG"]
     X = df.drop(columns=["FLAG"])
 
-    # ERC20 ile ilgili metin / kategorik sütunları çıkar (sayısal ERC20 özellikleri kalır)
+    # Drop non-numeric ERC20 text columns (numeric ERC20 stats remain)
     erc20_text_cols = [
         c
         for c in X.columns
@@ -50,7 +50,7 @@ def load_and_clean_data(csv_path: Path) -> tuple[pd.DataFrame, pd.Series]:
     if erc20_text_cols:
         X = X.drop(columns=erc20_text_cols)
 
-    # Sadece sayısal özellikler
+    # Numeric features only
     X = X.select_dtypes(include=[np.number])
 
     return X, y
@@ -68,7 +68,7 @@ def main() -> None:
         stratify=y,
     )
 
-    # Eksik değerler: eğitim setine göre medyan (sızıntı olmadan)
+    # Missing values: median imputer fit on train only (no leakage)
     model = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
@@ -93,8 +93,8 @@ def main() -> None:
 
     joblib.dump(model, MODEL_PATH)
     joblib.dump(feature_names, FEATURES_PATH)
-    print(f"Model kaydedildi: {MODEL_PATH}")
-    print(f"Özellik listesi kaydedildi: {FEATURES_PATH} ({len(feature_names)} özellik)")
+    print(f"Model saved: {MODEL_PATH}")
+    print(f"Feature list saved: {FEATURES_PATH} ({len(feature_names)} features)")
 
 
 if __name__ == "__main__":

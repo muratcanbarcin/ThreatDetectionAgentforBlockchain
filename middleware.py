@@ -1,5 +1,5 @@
 """
-Hybrid Detection Engine: GoPlus kara liste + Random Forest anomali + Groq uyarısı.
+Hybrid Detection Engine: GoPlus blacklist + Random Forest anomaly scoring + Groq advisory.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ class ThreatDetectionAgent:
         self._groq: Groq | None = Groq(api_key=api_key) if api_key else None
 
     def fetch_goplus_security(self, address: str) -> tuple[bool, dict[str, Any]]:
-        """GoPlus API tam JSON yanıtı ve kara liste kararı (UI / log için)."""
+        """Full GoPlus API JSON response and blacklist decision (for UI / logging)."""
         url = GOPLUS_TEMPLATE.format(address=address)
         try:
             resp = requests.get(url, timeout=15)
@@ -70,23 +70,18 @@ class ThreatDetectionAgent:
         self, address: str, threat_reason: str
     ) -> dict[str, Any]:
         prompt = (
-            f"Şu cüzdan adresi ({address}) {threat_reason} nedeniyle riskli bulundu. "
-            "Durumu değrlendir ve eğer riskli ise işlemi iptal etmesini söyleyen 2-3 cümlelik profesyonel bir "
-            "siber güvenlik uyarısı yaz veya eğer riskli değilse işlemi onayla"
-            "Her bir sonucun için bir güven skoru ver."
-            "Güven skoru 0-100 arasında bir sayıdır."
-            "0-20: Çok düşük güven"
-            "21-40: Düşük güven"
-            "41-60: Orta güven"
-            "61-80: Yüksek güven"
-            "81-100: Çok yüksek güven"
-            "Güven skoru 80 ve üzeri ise işlemi onayla, 80'in altında ise işlemi iptal etmeyi öner"
+            f"This wallet address ({address}) was flagged as risky because: {threat_reason}. "
+            "Assess the situation and write a 2-3 sentence professional cybersecurity advisory telling "
+            "the user to cancel the transaction if it still looks risky, or to approve if it does not. "
+            "For each conclusion, give a confidence score from 0 to 100: "
+            "0-20 very low; 21-40 low; 41-60 medium; 61-80 high; 81-100 very high. "
+            "If the confidence score is 80 or above, approve the transaction; below 80, recommend cancellation."
         )
 
         if self._groq is None:
             text = (
-                "Uyarı: GROQ_API_KEY tanımlı değil; LLM devre dışı. "
-                f"Adres {address} için {threat_reason} tespit edildi; işlemi iptal etmeniz önerilir."
+                "Warning: GROQ_API_KEY is not set; LLM is disabled. "
+                f"For address {address}, {threat_reason} was detected; canceling the transaction is recommended."
             )
             return {"content": text, "groq_raw": None, "used_llm": False}
 
@@ -106,8 +101,8 @@ class ThreatDetectionAgent:
             return {"content": text, "groq_raw": raw, "used_llm": True}
         except Exception as e:
             text = (
-                "Uyarı: Groq çağrısı başarısız (ağ veya kota). "
-                f"Adres {address} için {threat_reason} tespit edildi; işlemi iptal etmeniz önerilir."
+                "Warning: Groq request failed (network or quota). "
+                f"For address {address}, {threat_reason} was detected; canceling the transaction is recommended."
             )
             return {"content": text, "groq_raw": {"error": str(e)}, "used_llm": False}
 
@@ -126,9 +121,12 @@ class ThreatDetectionAgent:
 
         if blacklisted or anomalous:
             if blacklisted:
-                reason = "GoPlus kara liste / güvenlik bayrakları (phishing, kötü amaçlı davranış veya hırsızlık riski)"
+                reason = (
+                    "GoPlus blacklist / security flags "
+                    "(phishing, malicious behavior, or theft risk)"
+                )
             else:
-                reason = "makine öğrenmesi tabanlı anomali skoru"
+                reason = "machine-learning-based anomaly score"
 
             llm_text = self.generate_llm_warning(address, reason)
             latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -149,10 +147,10 @@ class ThreatDetectionAgent:
 def _fraud_profile_for_demo(
     feature_names: list[str], model: Any, max_tweaks: int = 12
 ) -> dict[str, float]:
-    """Sıfır tabanlı mock üzerine birkaç sütunu FLAG=1 örneğinden doldurur; RF tahmini 1 olana kadar genişletir."""
+    """Fill a zero mock vector from FLAG=1 sample columns until RF predicts class 1."""
     csv_path = ROOT / "data" / "transaction_dataset.csv"
     if not csv_path.is_file():
-        raise FileNotFoundError(f"Demo için veri seti bulunamadı: {csv_path}")
+        raise FileNotFoundError(f"Dataset not found for demo: {csv_path}")
 
     df = pd.read_csv(csv_path)
     df.columns = df.columns.str.strip().str.replace(r"\s+", " ", regex=True)
@@ -202,25 +200,27 @@ if __name__ == "__main__":
 
     safe_features: dict[str, float] = {name: 0.0 for name in features}
     try:
-        # Sıfır vektör + eğitimdeki FLAG=1 profilinden seçilen birkaç güçlü sütun (RF=1 için)
+        # Zero vector plus strong columns from a FLAG=1 training row until RF predicts 1
         anomalous_features = _fraud_profile_for_demo(features, agent._model)
     except FileNotFoundError as e:
-        print(f"[Uyarı] Anomali demo: {e}")
+        print(f"[Warning] Anomaly demo: {e}")
         anomalous_features = dict(safe_features)
 
     vitalik = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
     tether = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
 
-    print("=== Senaryo 1: Safe (temiz adres + sıfır özellikler) ===")
+    print("=== Scenario 1: Safe (clean address + zero features) ===")
     print(agent.evaluate_transaction(vitalik, safe_features))
 
-    print("\n=== Senaryo 2: Blacklisted (GoPlus yerine check_blacklist=True simülasyonu) ===")
+    print("\n=== Scenario 2: Blacklisted (simulated check_blacklist=True instead of GoPlus) ===")
     fake_phishing = "0x0000000000000000000000000000000000000bad"
     with patch.object(ThreatDetectionAgent, "check_blacklist", return_value=True):
         print(agent.evaluate_transaction(fake_phishing, safe_features))
 
-    print("\n=== Senaryo 3: Anomaly (güvenli adres + dolandırıcılık örüntülü özellikler) ===")
+    print("\n=== Scenario 3: Anomaly (safe address + fraud-pattern features) ===")
     print(agent.evaluate_transaction(vitalik, anomalous_features))
 
-    print("\n=== Ek: Tether kontratı + sıfır özellik (GoPlus canlı yanıt, kara liste olmayabilir) ===")
+    print(
+        "\n=== Extra: Tether contract + zero features (live GoPlus; may not be blacklisted) ==="
+    )
     print(agent.evaluate_transaction(tether, safe_features))
