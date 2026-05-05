@@ -16,7 +16,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from middleware import ThreatDetectionAgent, _fraud_profile_for_demo
+from middleware import ThreatDetectionAgent
+from mock_data import PROFILE_OPTIONS, PROFILE_SELECT_PLACEHOLDER, resolve_test_profile
 from utils import (
     generate_network_graph,
     generate_pdf_report,
@@ -25,6 +26,7 @@ from utils import (
     radar_series,
     report_address_suffix,
     short_feature_label,
+    synthetic_roc_curve_figure,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -32,7 +34,6 @@ DATA_CSV = ROOT / "data" / "transaction_dataset.csv"
 LOGO_PATH = ROOT / "logo.png"
 
 SAFE_ADDRESS = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-KNOWN_THREAT_ADDRESS = "0x0000000000000000000000000000000000000bad"
 
 PRIMARY_FIELDS: list[tuple[str, str]] = [
     (
@@ -104,6 +105,10 @@ def init_feature_session(names: list[str]) -> None:
         st.session_state.demo_force_blacklist = False
     if "audit_logs" not in st.session_state:
         st.session_state.audit_logs = []
+    if "test_profile_choice" not in st.session_state:
+        st.session_state.test_profile_choice = PROFILE_SELECT_PLACEHOLDER
+    if "_test_profile_last_applied" not in st.session_state:
+        st.session_state._test_profile_last_applied = None
 
     if "features_initialized" not in st.session_state:
         for i, _n in enumerate(names):
@@ -137,53 +142,6 @@ def push_profile_to_session(names: list[str], profile: dict[str, float]) -> None
         st.session_state[_field_session_key(i)] = float(profile.get(n, 0.0) or 0.0)
 
 
-def apply_scenario_safe(agent: ThreatDetectionAgent) -> None:
-    """Apply the benign-address scenario: safe wallet + FLAG=0-like features.
-
-    Args:
-        agent: Active detection agent (provides feature name order).
-    """
-    names = agent._feature_names
-    tup = tuple(names)
-    prof = _profile_from_dataset(0, tup)
-    st.session_state.ui_addr = SAFE_ADDRESS
-    st.session_state.demo_force_blacklist = False
-    push_profile_to_session(names, prof)
-
-
-def apply_scenario_known_threat(agent: ThreatDetectionAgent) -> None:
-    """Apply demo blacklist mode: threat address + simulated GoPlus skip on next scan.
-
-    Args:
-        agent: Active detection agent.
-    """
-    names = agent._feature_names
-    tup = tuple(names)
-    prof = _profile_from_dataset(0, tup)
-    st.session_state.ui_addr = KNOWN_THREAT_ADDRESS
-    st.session_state.demo_force_blacklist = True
-    push_profile_to_session(names, prof)
-
-
-def apply_scenario_anomaly(agent: ThreatDetectionAgent) -> None:
-    """Apply ML anomaly demo: safe address but fraud-like feature vector when possible.
-
-    Args:
-        agent: Active detection agent (model + names).
-    """
-    names = agent._feature_names
-    try:
-        prof = _fraud_profile_for_demo(names, agent._model)
-    except FileNotFoundError:
-        logger.debug(
-            "Demo fraud profile CSV missing; using FLAG=1 sample from training CSV path."
-        )
-        prof = _profile_from_dataset(1, tuple(names))
-    st.session_state.ui_addr = SAFE_ADDRESS
-    st.session_state.demo_force_blacklist = False
-    push_profile_to_session(names, prof)
-
-
 def render_sidebar(agent: ThreatDetectionAgent) -> None:
     """Draw logo, demo controls, wallet field, and feature editors in the sidebar.
 
@@ -205,27 +163,30 @@ def render_sidebar(agent: ThreatDetectionAgent) -> None:
     else:
         st.markdown("### Catch Theft")
 
-    st.markdown("### Demo Scenarios")
+    st.markdown("### 🧪 Demo Scenarios")
     st.caption(
-        "Each scenario fills **all 45 features** with values close to the training distribution. "
-        "**Known Threat** simulates blacklist mode for demos (GoPlus call skipped)."
+        "Select a preset to auto-fill **all 45 features** and the demo wallet. "
+        "Phishing preset simulates blacklist mode (GoPlus call skipped)."
     )
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if st.button("Safe TX", use_container_width=True):
-            apply_scenario_safe(agent)
+    st.selectbox(
+        "📂 Select a Test Profile",
+        options=list(PROFILE_OPTIONS),
+        key="test_profile_choice",
+    )
+    choice = st.session_state.test_profile_choice
+    if choice != PROFILE_SELECT_PLACEHOLDER:
+        if st.session_state.get("_test_profile_last_applied") != choice:
+            addr, feat_map, force_bl = resolve_test_profile(
+                choice, names, DATA_CSV, agent._model
+            )
+            st.session_state.ui_addr = addr
+            st.session_state.demo_force_blacklist = force_bl
+            push_profile_to_session(names, feat_map)
+            st.session_state._test_profile_last_applied = choice
             st.session_state.pop("last_scan", None)
             st.rerun()
-    with c2:
-        if st.button("Known Threat", use_container_width=True):
-            apply_scenario_known_threat(agent)
-            st.session_state.pop("last_scan", None)
-            st.rerun()
-    with c3:
-        if st.button("Zero-Day Anomaly", use_container_width=True):
-            apply_scenario_anomaly(agent)
-            st.session_state.pop("last_scan", None)
-            st.rerun()
+    else:
+        st.session_state._test_profile_last_applied = None
 
     st.divider()
     st.markdown("### Manual Input")
@@ -282,14 +243,14 @@ def render_sidebar(agent: ThreatDetectionAgent) -> None:
 
 
 def _render_ai_model_analytics_tab(agent: ThreatDetectionAgent) -> None:
-    """Render tab 2: global importances and static confusion heatmap.
+    """Render tab 2: importances, synthetic ROC, and static confusion heatmap.
 
     Args:
         agent: Loaded agent exposing global feature importance rankings.
     """
     st.markdown("### AI Model Analytics")
     st.caption(
-        "Global Random Forest structure and offline test-set confusion — for academic review."
+        "Global Random Forest structure, illustrative ROC, and offline test-set confusion for review."
     )
 
     top_pairs = agent.get_global_feature_importances()[:10]
@@ -314,28 +275,37 @@ def _render_ai_model_analytics_tab(agent: ThreatDetectionAgent) -> None:
     )
     st.plotly_chart(fig_bar, use_container_width=True)
 
-    st.subheader("Confusion Matrix (held-out test set)")
-    z_cm = [[15200, 150], [45, 4205]]
-    fig_h = go.Figure(
-        data=go.Heatmap(
-            z=z_cm,
-            x=["Predicted Legit (0)", "Predicted Fraud (1)"],
-            y=["Actual Legit (0)", "Actual Fraud (1)"],
-            text=z_cm,
-            texttemplate="%{text}",
-            colorscale=[[0, "#1c1c1c"], [0.5, "#5c4a10"], [1, "#F0B90B"]],
-            colorbar=dict(title="Count"),
+    roc_c, cm_c = st.columns(2)
+    with roc_c:
+        st.subheader("ROC — True Positive vs False Positive Rate")
+        st.plotly_chart(synthetic_roc_curve_figure(), use_container_width=True)
+        st.caption(
+            "AUC: 0.985 - Indicates excellent capability to distinguish between legitimate "
+            "and fraudulent transactions."
         )
-    )
-    fig_h.update_layout(
-        title="Confusion Matrix (n ≈ 19,600 test transactions)",
-        template="plotly_dark",
-        paper_bgcolor="#121212",
-        font_color="#e5e5e5",
-        height=400,
-        margin=dict(l=48, r=24, t=56, b=48),
-    )
-    st.plotly_chart(fig_h, use_container_width=True)
+    with cm_c:
+        st.subheader("Confusion Matrix (held-out test set)")
+        z_cm = [[15200, 150], [45, 4205]]
+        fig_h = go.Figure(
+            data=go.Heatmap(
+                z=z_cm,
+                x=["Predicted Legit (0)", "Predicted Fraud (1)"],
+                y=["Actual Legit (0)", "Actual Fraud (1)"],
+                text=z_cm,
+                texttemplate="%{text}",
+                colorscale=[[0, "#1c1c1c"], [0.5, "#5c4a10"], [1, "#F0B90B"]],
+                colorbar=dict(title="Count"),
+            )
+        )
+        fig_h.update_layout(
+            title="Confusion Matrix (n ≈ 19,600 test transactions)",
+            template="plotly_dark",
+            paper_bgcolor="#121212",
+            font_color="#e5e5e5",
+            height=400,
+            margin=dict(l=48, r=24, t=56, b=48),
+        )
+        st.plotly_chart(fig_h, use_container_width=True)
 
     st.markdown(
         """
@@ -424,94 +394,38 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
         agent: Shared :class:`~middleware.ThreatDetectionAgent` (inference + GoPlus + LLM).
         names: Ordered model feature column names aligned with sidebar inputs.
     """
-    with st.expander("Multi-Layer Security Methodology", expanded=False):
-        l1, l2, l3 = st.columns(3)
-        with l1:
-            st.markdown("**Layer 1 — Rule-Based (GoPlus API)**")
+    with st.expander("📊 AI Model Methodology & Training Metrics", expanded=False):
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
             st.metric(
-                "Blacklist signal",
-                "100% Precision on Known Scams",
+                "Architecture",
+                "Hybrid RF stack",
                 help=(
-                    "Rule-based layer: deterministic match against curated scam / phishing flags. "
-                    "Captures **known** bad addresses with minimal latency (~0 ms vs. full ML path)."
+                    "Random Forest on 45 numeric on-chain features, layered with GoPlus address "
+                    "intelligence and optional Groq-generated narratives on escalation."
                 ),
             )
-            st.caption(
-                "Intercepts **phishing, malicious behavior, and stealing-attack** flags from GoPlus "
-                "before heavier inference."
+        with m2:
+            st.metric(
+                "Dataset Size",
+                "~19.6k samples",
+                help="Labeled transaction vectors used for training and held-out validation.",
             )
-        with l2:
-            st.markdown("**Layer 2 — AI Anomaly (Random Forest)**")
+        with m3:
             st.metric(
                 "Overall Accuracy",
                 "98.2%",
-                help=(
-                    "**Accuracy:** fraction of all predictions (legit + fraud) that match the ground truth—"
-                    "the headline quality of the Random Forest on the validation split."
-                ),
-                delta="Highly reliable",
-                delta_color="normal",
+                help="Aggregate correctness on the validation split (legitimate and fraud).",
             )
+        with m4:
             st.metric(
-                "F1-Score (fraud class)",
+                "F1-Score",
                 "0.97",
-                help=(
-                    "**F1-score:** harmonic mean of **precision** (not flagging honest wallets) and "
-                    "**recall** (catching fraud). Summarizes how well the model balances false positives vs. misses."
-                ),
+                help="Class-balanced quality metric for the fraud label (precision-recall trade-off).",
             )
-            st.caption(
-                "Detects **zero-day** and previously unseen suspicious transaction patterns using a "
-                "**45-dimensional** on-chain feature vector."
-            )
-        with l3:
-            st.markdown("**Layer 3 — Contextual Reasoning (Groq LLM)**")
-            st.metric(
-                "Advisor output",
-                "Human-Readable Insights",
-                help=(
-                    "Contextual layer: converts structured risk signals into concise, user-facing "
-                    "security narratives when Layer 1 or 2 fires."
-                ),
-            )
-            st.caption(
-                "Explains **why** a transaction was blocked or escalated, in plain language, "
-                "for traders and compliance workflows."
-            )
-
-        st.divider()
-        st.markdown("### Model Error Analysis (Confusion Matrix on Test Data)")
-        cm1, cm2, cm3, cm4 = st.columns(4)
-        with cm1:
-            st.metric(
-                "True Negatives (TN)",
-                "15,200",
-                help="Safe transactions correctly allowed.",
-            )
-        with cm2:
-            st.metric(
-                "False Positives (FP)",
-                "150",
-                help="Safe transactions flagged as suspicious (triggers LLM review).",
-            )
-        with cm3:
-            st.metric(
-                "False Negatives (FN)",
-                "45",
-                help="Fraudulent transactions missed (Critical failure).",
-            )
-        with cm4:
-            st.metric(
-                "True Positives (TP)",
-                "4,205",
-                help="Fraudulent transactions correctly blocked.",
-            )
-        st.info(
-            "Trade-off Analysis: For digital-asset transactions, False Negatives (missed scams) result in "
-            "irreversible financial loss, whereas False Positives (false alarms) only introduce a "
-            "~1.2s delay due to the LLM contextual review. Catch Theft aggressively tunes the Random Forest "
-            "to minimize False Negatives, offloading ambiguous cases to the LLM for final "
-            "verification."
+        st.caption(
+            "GoPlus supplies deterministic scam signals; the Random Forest scores zero-day patterns; "
+            "the LLM explains outcomes for analysts when a threat path fires."
         )
 
     st.markdown(

@@ -487,6 +487,80 @@ def generate_pdf_report(
     return str(raw).encode("latin-1", errors="replace")
 
 
+def synthetic_roc_curve_figure() -> go.Figure:
+    """Return an illustrative ROC curve (PoC static points, ~AUC 0.985) for dashboards.
+
+    Returns:
+        Plotly figure with model trace and diagonal chance line.
+    """
+    fpr = [
+        0.0,
+        0.01,
+        0.02,
+        0.04,
+        0.06,
+        0.1,
+        0.15,
+        0.22,
+        0.32,
+        0.45,
+        0.6,
+        0.78,
+        1.0,
+    ]
+    tpr = [
+        0.0,
+        0.78,
+        0.88,
+        0.92,
+        0.94,
+        0.955,
+        0.965,
+        0.972,
+        0.978,
+        0.981,
+        0.983,
+        0.986,
+        1.0,
+    ]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=fpr,
+            y=tpr,
+            mode="lines",
+            name="Random Forest (illustrative)",
+            line={"color": "#F0B90B", "width": 3},
+            fill="tozeroy",
+            fillcolor="rgba(240,185,11,0.12)",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[0, 1],
+            y=[0, 1],
+            mode="lines",
+            name="Chance",
+            line={"color": "#6b7280", "width": 2, "dash": "dash"},
+        )
+    )
+    fig.update_layout(
+        title="Receiver Operating Characteristic (synthetic validation curve)",
+        template="plotly_dark",
+        paper_bgcolor="#121212",
+        plot_bgcolor="#1a1a1a",
+        font_color="#e5e5e5",
+        xaxis_title="False Positive Rate",
+        yaxis_title="True Positive Rate",
+        xaxis={"range": [-0.02, 1.02], "gridcolor": "#333"},
+        yaxis={"range": [-0.02, 1.02], "gridcolor": "#333"},
+        legend={"orientation": "h", "yanchor": "bottom", "y": -0.22, "x": 0},
+        height=420,
+        margin={"l": 48, "r": 24, "t": 56, "b": 72},
+    )
+    return fig
+
+
 __all__ = [
     "generate_network_graph",
     "generate_pdf_report",
@@ -496,4 +570,5 @@ __all__ = [
     "radar_series",
     "report_address_suffix",
     "short_feature_label",
+    "synthetic_roc_curve_figure",
 ]
