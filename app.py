@@ -11,15 +11,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-import fpdf
 import pandas as pd
-from fpdf import FPDF
-import networkx as nx
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
 from middleware import ThreatDetectionAgent, _fraud_profile_for_demo
+from utils import (
+    generate_network_graph,
+    generate_pdf_report,
+    profile_from_dataset,
+    radar_dimension_names,
+    radar_series,
+    report_address_suffix,
+    short_feature_label,
+)
 
 ROOT = Path(__file__).resolve().parent
 DATA_CSV = ROOT / "data" / "transaction_dataset.csv"
@@ -57,40 +63,16 @@ def get_agent() -> ThreatDetectionAgent:
 def _profile_from_dataset(flag: Literal[0, 1], feature_names: tuple[str, ...]) -> dict[str, float]:
     """Sample one labeled row from the training CSV projected onto *feature_names*.
 
+    Result is cached by Streamlit for responsive scenario presets.
+
     Args:
         flag: ``0`` for legitimate rows, ``1`` for fraud rows.
         feature_names: Expected column order from the trained model.
 
     Returns:
         Mapping of feature name to float value; if the CSV is missing, all zeros.
-
-    Note:
-        If the file exists but is malformed, pandas may raise while reading or indexing.
     """
-    if not DATA_CSV.is_file():
-        return {n: 0.0 for n in feature_names}
-
-    df = pd.read_csv(DATA_CSV)
-    df.columns = df.columns.str.strip().str.replace(r"\s+", " ", regex=True)
-    drop_cols = [
-        c
-        for c in df.columns
-        if c.lower() in ("index", "address", "unnamed: 0") or c == "Unnamed: 0"
-    ]
-    df = df.drop(columns=drop_cols, errors="ignore")
-    y = df["FLAG"]
-    X = df.drop(columns=["FLAG"])
-    erc20_text = [
-        c
-        for c in X.columns
-        if "erc20" in c.lower() and not pd.api.types.is_numeric_dtype(X[c])
-    ]
-    if erc20_text:
-        X = X.drop(columns=erc20_text)
-    X = X.select_dtypes(include=["number"])
-    X = X[list(feature_names)]
-    row = X.loc[y == flag].iloc[0]
-    return {k: float(row[k]) for k in feature_names}
+    return profile_from_dataset(DATA_CSV, flag, feature_names)
 
 
 def _field_session_key(i: int) -> str:
@@ -110,9 +92,6 @@ def init_feature_session(names: list[str]) -> None:
 
     Args:
         names: Ordered feature column names from the loaded model.
-
-    Returns:
-        None
     """
     if "feature_names_order" not in st.session_state:
         st.session_state.feature_names_order = list(names)
@@ -153,9 +132,6 @@ def push_profile_to_session(names: list[str], profile: dict[str, float]) -> None
     Args:
         names: Ordered feature names.
         profile: Values to assign (missing keys default to 0).
-
-    Returns:
-        None
     """
     for i, n in enumerate(names):
         st.session_state[_field_session_key(i)] = float(profile.get(n, 0.0) or 0.0)
@@ -166,9 +142,6 @@ def apply_scenario_safe(agent: ThreatDetectionAgent) -> None:
 
     Args:
         agent: Active detection agent (provides feature name order).
-
-    Returns:
-        None
     """
     names = agent._feature_names
     tup = tuple(names)
@@ -183,9 +156,6 @@ def apply_scenario_known_threat(agent: ThreatDetectionAgent) -> None:
 
     Args:
         agent: Active detection agent.
-
-    Returns:
-        None
     """
     names = agent._feature_names
     tup = tuple(names)
@@ -200,9 +170,6 @@ def apply_scenario_anomaly(agent: ThreatDetectionAgent) -> None:
 
     Args:
         agent: Active detection agent (model + names).
-
-    Returns:
-        None
     """
     names = agent._feature_names
     try:
@@ -222,9 +189,6 @@ def render_sidebar(agent: ThreatDetectionAgent) -> None:
 
     Args:
         agent: Provides canonical feature ordering for inputs.
-
-    Returns:
-        None
     """
     names = agent._feature_names
     init_feature_session(names)
@@ -317,389 +281,12 @@ def render_sidebar(agent: ThreatDetectionAgent) -> None:
     )
 
 
-def _short_label(name: str, max_len: int = 24) -> str:
-    """Truncate long feature labels for radar axis text."""
-    return name if len(name) <= max_len else name[: max_len - 1] + "…"
-
-
-def _radar_dimension_names(
-    xai: list[dict[str, Any]] | None,
-    agent: ThreatDetectionAgent,
-    limit: int = 8,
-) -> list[str]:
-    """Pick radar axes: XAI top features first, then highest global importances."""
-    keys: list[str] = []
-    if xai:
-        for item in xai:
-            n = str(item.get("name", ""))
-            if n and n not in keys:
-                keys.append(n)
-    for fname, _imp in agent.get_global_feature_importances():
-        if fname not in keys:
-            keys.append(fname)
-        if len(keys) >= limit:
-            break
-    return keys[:limit]
-
-
-def _radar_series(
-    keys: list[str], current: dict[str, float], baseline: dict[str, float]
-) -> tuple[list[float], list[float]]:
-    """Per-axis magnitude normalization to [0, 1] for comparable radar traces."""
-    cur: list[float] = []
-    bas: list[float] = []
-    for k in keys:
-        c = float(current.get(k, 0) or 0)
-        b = float(baseline.get(k, 0) or 0)
-        m = max(abs(c), abs(b), 1e-12)
-        cur.append(float(abs(c) / m))
-        bas.append(float(abs(b) / m))
-    return cur, bas
-
-
-def _network_center_label(target_address: str) -> str:
-    """Short on-graph label for the focal wallet (synthetic demo graph)."""
-    a = (target_address or "").strip()
-    if len(a) > 18:
-        return f"{a[:8]}…{a[-6:]}"
-    return a or "Target wallet"
-
-
-def generate_network_graph(target_address: str, is_threat: bool) -> go.Figure:
-    """Build a synthetic local transaction-trail-style graph for demo visualization.
-
-    Uses ``networkx.spring_layout`` and Plotly scatter traces (edges + nodes). This is a
-    **storytelling** view, not real on-chain clustering.
-
-    Args:
-        target_address: Wallet under review (shown as the graph center).
-        is_threat: If True, draw a denser high-risk motif; otherwise a benign exchange/star pattern.
-
-    Returns:
-        Plotly figure with ``template='plotly_dark'``.
-    """
-    G = nx.Graph()
-    center = _network_center_label(target_address)
-    G.add_node(center, node_role="center", threat=is_threat)
-
-    if not is_threat:
-        leaves = [
-            "Binance Hot Wallet",
-            "Coinbase",
-            "User Wallet",
-            "User Wallet 2",
-            "User Wallet 3",
-        ]
-        for name in leaves:
-            G.add_node(name, node_role="benign", threat=False)
-            G.add_edge(center, name)
-    else:
-        mix = "Tornado Cash (Mixer)"
-        phish = "Known Phishing Contract"
-        dark = "Darkweb Entity"
-        relay = "Suspicious Relay"
-        peel = "Peel Chain Node"
-        dust = "Dust / Hop Account"
-        for n in (mix, phish, dark, relay, peel, dust):
-            G.add_node(n, node_role="risk", threat=True)
-        G.add_edge(center, relay)
-        G.add_edge(center, peel)
-        G.add_edge(relay, mix)
-        G.add_edge(relay, phish)
-        G.add_edge(peel, dark)
-        G.add_edge(peel, dust)
-        G.add_edge(dust, mix)
-        G.add_edge(mix, phish)
-        G.add_edge(phish, relay)
-        G.add_edge(dark, mix)
-        G.add_edge(center, dust)
-
-    pos = nx.spring_layout(G, seed=42, k=0.9 if is_threat else 0.55, iterations=80)
-
-    edge_x: list[float | None] = []
-    edge_y: list[float | None] = []
-    ec = "#94a3b8" if is_threat else "#64748b"
-    for u, v_e in G.edges():
-        x0, y0 = pos[u]
-        x1, y1 = pos[v_e]
-        edge_x.extend([x0, x1, None])
-        edge_y.extend([y0, y1, None])
-    edge_trace = go.Scatter(
-        x=edge_x,
-        y=edge_y,
-        line=dict(width=1.8, color=ec),
-        hoverinfo="skip",
-        mode="lines",
-        showlegend=False,
-    )
-
-    node_x = [pos[n][0] for n in G.nodes()]
-    node_y = [pos[n][1] for n in G.nodes()]
-    colors: list[str] = []
-    sizes: list[int] = []
-    for n in G.nodes():
-        role = G.nodes[n].get("node_role", "")
-        thr = bool(G.nodes[n].get("threat", is_threat))
-        if role == "center":
-            colors.append("#f97316" if thr else "#2563eb")
-            sizes.append(28)
-        elif thr or role == "risk":
-            if "Tornado" in n:
-                colors.append("#dc2626")
-            elif "Phishing" in n:
-                colors.append("#eab308")
-            elif "Darkweb" in n:
-                colors.append("#b45309")
-            else:
-                colors.append("#9f1239")
-            sizes.append(22)
-        else:
-            if "Binance" in n:
-                colors.append("#16a34a")
-            elif "Coinbase" in n:
-                colors.append("#15803d")
-            else:
-                colors.append("#38bdf8")
-            sizes.append(20)
-
-    node_trace = go.Scatter(
-        x=node_x,
-        y=node_y,
-        mode="markers+text",
-        text=list(G.nodes()),
-        textposition="top center",
-        textfont=dict(size=10, color="#e5e5e5"),
-        hovertext=list(G.nodes()),
-        hoverinfo="text",
-        marker=dict(
-            size=sizes,
-            color=colors,
-            line=dict(width=1.2, color="rgba(255,255,255,0.35)"),
-        ),
-        showlegend=False,
-    )
-
-    fig = go.Figure(data=[edge_trace, node_trace])
-    fig.update_layout(
-        template="plotly_dark",
-        title=dict(
-            text=(
-                "Synthetic local network — high-risk exposure"
-                if is_threat
-                else "Synthetic local network — venue / retail flow"
-            ),
-            font=dict(size=14, color="#e5e5e5"),
-        ),
-        paper_bgcolor="#121212",
-        plot_bgcolor="#121212",
-        xaxis=dict(visible=False, scaleanchor="y", scaleratio=1),
-        yaxis=dict(visible=False),
-        margin=dict(l=24, r=24, t=56, b=24),
-        showlegend=False,
-        height=520,
-        hovermode="closest",
-    )
-    return fig
-
-
-def _report_address_suffix(address: str) -> str:
-    """Last 4 alphanumeric characters of *address* for filename (uppercased)."""
-    alnum = "".join(c for c in (address or "").strip() if c.isalnum())
-    if len(alnum) >= 4:
-        return alnum[-4:].upper()
-    return (alnum.upper() if alnum else "0000")
-
-
-def _pdf_safe_text(value: str | None) -> str:
-    """Make text safe for PDF core fonts (Helvetica): Latin-1 subset only."""
-    if value is None:
-        return ""
-    t = str(value)
-    for a, b in (
-        ("\u2014", "-"),
-        ("\u2013", "-"),
-        ("\u2019", "'"),
-        ("\u2018", "'"),
-        ("\u2032", "'"),
-        ("\u2026", "..."),
-        ("\u200b", ""),
-        ("\ufeff", ""),
-        ("\u26a0\ufe0f", "[!] "),
-        ("\u26a0", "[!] "),
-    ):
-        t = t.replace(a, b)
-    return t.encode("latin-1", errors="replace").decode("latin-1")
-
-
-def generate_pdf_report(
-    address: str,
-    verdict: str,
-    confidence: float,
-    latency: float | int,
-    xai_features: list[dict[str, Any]] | None,
-    llm_report: str | None,
-) -> bytes:
-    """Build a compliance-style threat report PDF and return raw bytes.
-
-    Args:
-        address: Wallet address under review.
-        verdict: Final Catch Theft verdict string.
-        confidence: Model confidence score for the predicted class (percentage).
-        latency: End-to-end scan latency in milliseconds.
-        xai_features: Top contributing features from XAI, if any.
-        llm_report: Raw advisory text from the LLM layer.
-
-    Returns:
-        PDF document as bytes suitable for ``st.download_button``.
-    """
-    pdf = FPDF(orientation="P", unit="mm", format="A4")
-    pdf.set_auto_page_break(auto=True, margin=18)
-    pdf.set_margins(18, 18, 18)
-
-    font_dir = Path(fpdf.__file__).resolve().parent / "font"
-    body_font = "Helvetica"
-    try:
-        dejavu_r = font_dir / "DejaVuSans.ttf"
-        dejavu_b = font_dir / "DejaVuSans-Bold.ttf"
-        if dejavu_r.is_file():
-            pdf.add_font("DejaVu", "", str(dejavu_r))
-            if dejavu_b.is_file():
-                pdf.add_font("DejaVu", "B", str(dejavu_b))
-            body_font = "DejaVu"
-    except (OSError, ValueError):
-        body_font = "Helvetica"
-
-    pdf.add_page()
-
-    # Header
-    pdf.set_font(body_font, "B", 20)
-    pdf.set_text_color(24, 24, 24)
-    pdf.cell(
-        0,
-        12,
-        _pdf_safe_text("CATCH THEFT THREAT INTELLIGENCE REPORT"),
-        align="C",
-        new_x="LMARGIN",
-        new_y="NEXT",
-    )
-    pdf.set_draw_color(200, 160, 40)
-    pdf.set_line_width(0.4)
-    pdf.line(18, pdf.get_y(), 192, pdf.get_y())
-    pdf.ln(6)
-
-    pdf.set_font(body_font, "", 9)
-    pdf.set_text_color(80, 80, 80)
-    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    pdf.cell(0, 5, _pdf_safe_text(f"Document generated: {generated}"), new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(
-        0,
-        5,
-        _pdf_safe_text(
-            "Classification: CONFIDENTIAL - Internal Security & Compliance Review"
-        ),
-        new_x="LMARGIN",
-        new_y="NEXT",
-    )
-    pdf.ln(6)
-
-    # Transaction details
-    pdf.set_font(body_font, "B", 12)
-    pdf.set_text_color(0, 0, 0)
-    pdf.cell(0, 8, _pdf_safe_text("1. TRANSACTION DETAILS"), new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font(body_font, "", 10)
-    pdf.set_text_color(30, 30, 30)
-    pdf.cell(
-        0, 6, _pdf_safe_text(f"Wallet address: {address or 'N/A'}"), new_x="LMARGIN", new_y="NEXT"
-    )
-    pdf.cell(
-        0,
-        6,
-        _pdf_safe_text(f"Processing latency: {float(latency):,.1f} ms"),
-        new_x="LMARGIN",
-        new_y="NEXT",
-    )
-    pdf.cell(
-        0,
-        6,
-        _pdf_safe_text(f"Risk / model confidence (argmax class): {float(confidence):.2f}%"),
-        new_x="LMARGIN",
-        new_y="NEXT",
-    )
-    pdf.cell(0, 6, _pdf_safe_text(f"Final verdict: {verdict}"), new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
-
-    # AI advisor
-    pdf.set_font(body_font, "B", 12)
-    pdf.cell(
-        0,
-        8,
-        _pdf_safe_text("2. AI SECURITY ADVISOR (LAYER 3)"),
-        new_x="LMARGIN",
-        new_y="NEXT",
-    )
-    pdf.set_font(body_font, "", 10)
-    advisory = (llm_report or "").strip() or "No LLM advisory was generated for this scan."
-    pdf.multi_cell(0, 5, _pdf_safe_text(advisory), new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(3)
-
-    # Critical flags
-    pdf.set_font(body_font, "B", 12)
-    pdf.cell(
-        0,
-        8,
-        _pdf_safe_text("3. CRITICAL FLAGS (XAI - TOP CONTRIBUTORS)"),
-        new_x="LMARGIN",
-        new_y="NEXT",
-    )
-    pdf.set_font(body_font, "", 10)
-    if xai_features:
-        for i, feat in enumerate(xai_features, start=1):
-            name = str(feat.get("name", ""))
-            val = feat.get("value")
-            imp = feat.get("importance")
-            score = feat.get("contribution_score")
-            line = (
-                f"{i}. Feature: {name}\n"
-                f"   Observed value: {val} | Global importance: {imp} "
-                f"| Contribution score: {score}"
-            )
-            pdf.multi_cell(0, 5, _pdf_safe_text(line), new_x="LMARGIN", new_y="NEXT")
-            pdf.ln(1)
-    else:
-        pdf.multi_cell(
-            0,
-            5,
-            _pdf_safe_text(
-                "No ML-derived critical feature ranking for this outcome "
-                "(e.g. verdict driven solely by rule-based blacklist, or benign classification)."
-            ),
-            new_x="LMARGIN",
-            new_y="NEXT",
-        )
-
-    pdf.ln(6)
-    pdf.set_font(body_font, "I", 8)
-    pdf.set_text_color(100, 100, 100)
-    pdf.multi_cell(
-        0,
-        4,
-        _pdf_safe_text(
-            "Disclaimer: This report is generated for operational security review. "
-            "It does not constitute legal or investment advice. "
-            "Retain in accordance with your organization's records policy."
-        ),
-        new_x="LMARGIN",
-        new_y="NEXT",
-    )
-
-    raw = pdf.output(dest="S")
-    if isinstance(raw, (bytes, bytearray)):
-        return bytes(raw)
-    return str(raw).encode("latin-1", errors="replace")
-
-
 def _render_ai_model_analytics_tab(agent: ThreatDetectionAgent) -> None:
-    """Plotly charts for global model interpretability and confusion matrix (tab 2)."""
+    """Render tab 2: global importances and static confusion heatmap.
+
+    Args:
+        agent: Loaded agent exposing global feature importance rankings.
+    """
     st.markdown("### AI Model Analytics")
     st.caption(
         "Global Random Forest structure and offline test-set confusion — for academic review."
@@ -764,7 +351,10 @@ and uses **Layer 3 (Groq)** to absorb ambiguous ML scores before any final human
 
 
 def _render_integration_audit_tab() -> None:
-    """Session audit memory, CSV export, and developer API integration examples."""
+    """Render tab 3: in-memory audit trail, CSV export, and API cookbook samples.
+
+    Uses the ``audit_logs`` list on Streamlit session state, appended after each successful scan.
+    """
     st.markdown("### Session Audit Trail (Memory Log)")
     logs = list(st.session_state.get("audit_logs") or [])
     cols = ["address", "verdict", "confidence_pct", "latency_ms", "timestamp"]
@@ -828,7 +418,12 @@ print(resp.json())""",
 
 
 def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> None:
-    """Primary demo: methodology expander, scan workflow, verdict, XAI radar, download, raw JSON."""
+    """Render tab 1: scan workflow, metrics, XAI radar, trace graph, PDF, and raw dumps.
+
+    Args:
+        agent: Shared :class:`~middleware.ThreatDetectionAgent` (inference + GoPlus + LLM).
+        names: Ordered model feature column names aligned with sidebar inputs.
+    """
     with st.expander("Multi-Layer Security Methodology", expanded=False):
         l1, l2, l3 = st.columns(3)
         with l1:
@@ -1182,11 +777,11 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
         if v == "SUSPICIOUS" and snap.get("xai_top_features"):
             st.subheader("XAI — Radar vs typical legitimate profile")
             xai_list = snap["xai_top_features"]
-            dim_names = _radar_dimension_names(xai_list, agent)
+            dim_names = radar_dimension_names(xai_list, agent)
             cur_f = dict(snap.get("features") or {})
             baseline = _profile_from_dataset(0, tuple(names))
-            r_cur, r_base = _radar_series(dim_names, cur_f, baseline)
-            labels = [_short_label(k) for k in dim_names]
+            r_cur, r_base = radar_series(dim_names, cur_f, baseline)
+            labels = [short_feature_label(k) for k in dim_names]
             if len(labels) >= 3:
                 rc = r_cur + [r_cur[0]]
                 rb = r_base + [r_base[0]]
@@ -1247,7 +842,7 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
                 snap.get("xai_top_features"),
                 snap.get("llm_warning"),
             )
-            pdf_name = f"Threat_Report_{_report_address_suffix(str(snap.get('wallet_address') or ''))}.pdf"
+            pdf_name = f"Threat_Report_{report_address_suffix(str(snap.get('wallet_address') or ''))}.pdf"
         except Exception:
             logger.exception("Failed to build threat PDF report")
             pdf_bytes = b""

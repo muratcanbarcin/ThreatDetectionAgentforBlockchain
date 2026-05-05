@@ -495,33 +495,4 @@ def _fraud_profile_for_demo(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    from unittest.mock import patch
-
-    agent = ThreatDetectionAgent()
-    features = agent._feature_names
-
-    safe_features: dict[str, float] = {name: 0.0 for name in features}
-    try:
-        anomalous_features = _fraud_profile_for_demo(features, agent._model)
-    except FileNotFoundError as e:
-        logger.warning("Anomaly demo profile unavailable: %s", e)
-        anomalous_features = dict(safe_features)
-
-    vitalik = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-    tether = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
-
-    logger.info("=== Scenario 1: Safe (clean address + zero features) ===")
-    logger.info("%s", agent.evaluate_transaction(vitalik, safe_features))
-
-    logger.info("=== Scenario 2: Blacklisted (simulated check_blacklist=True) ===")
-    fake_phishing = "0x0000000000000000000000000000000000000bad"
-    with patch.object(ThreatDetectionAgent, "check_blacklist", return_value=True):
-        logger.info("%s", agent.evaluate_transaction(fake_phishing, safe_features))
-
-    logger.info("=== Scenario 3: Anomaly (safe address + fraud-pattern features) ===")
-    logger.info("%s", agent.evaluate_transaction(vitalik, anomalous_features))
-
-    logger.info(
-        "=== Extra: Tether contract + zero features (live GoPlus; may not be blacklisted) ==="
-    )
-    logger.info("%s", agent.evaluate_transaction(tether, safe_features))
+    _ = ThreatDetectionAgent()
