@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import joblib
 import pandas as pd
@@ -49,6 +49,17 @@ def _is_timeout_error(exc: BaseException) -> bool:
     return "timeout" in msg or "timed out" in msg
 
 
+def _classifier_from_pipeline(model: Any) -> Any:
+    """Return the final estimator (RandomForest) from a sklearn Pipeline or the model itself."""
+    if hasattr(model, "named_steps"):
+        steps = getattr(model, "named_steps", {})
+        if isinstance(steps, dict) and "classifier" in steps:
+            return steps["classifier"]
+        if isinstance(steps, dict) and len(steps) > 0:
+            return steps[list(steps.keys())[-1]]
+    return model
+
+
 class ThreatDetectionAgent:
     """Coordinates GoPlus lookups, Random Forest scoring, and optional Groq text generation."""
 
@@ -64,6 +75,76 @@ class ThreatDetectionAgent:
 
         api_key = os.environ.get("GROQ_API_KEY")
         self._groq: Groq | None = Groq(api_key=api_key) if api_key else None
+
+    def _rf_estimator(self) -> Any:
+        """Resolved RandomForest (or final step) used for ``feature_importances_``."""
+        return _classifier_from_pipeline(self._model)
+
+    def _feature_importance_array(self) -> list[float]:
+        """Global feature importances aligned with :attr:`_feature_names`."""
+        clf = self._rf_estimator()
+        imps = getattr(clf, "feature_importances_", None)
+        if imps is None:
+            return [1.0 / max(1, len(self._feature_names))] * len(self._feature_names)
+        arr = cast(Any, imps)
+        return [float(x) for x in arr.tolist()]
+
+    def get_global_feature_importances(self) -> list[tuple[str, float]]:
+        """Feature names with global RF importances, sorted descending.
+
+        Returns:
+            Ordered list of ``(feature_name, importance)`` pairs.
+        """
+        pairs = list(zip(self._feature_names, self._feature_importance_array()))
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        return pairs
+
+    def _top_critical_features(
+        self, features_dict: dict[str, Any], top_k: int = 3
+    ) -> list[dict[str, Any]]:
+        """Rank features by ``importance × |value|`` (instance-level XAI heuristic).
+
+        Args:
+            features_dict: Current transaction features.
+            top_k: Number of leading contributors to return.
+
+        Returns:
+            List of dicts with ``name``, ``value``, ``importance``, ``contribution_score``.
+        """
+        imps = self._feature_importance_array()
+        scored: list[tuple[str, float, float, float]] = []
+        for name, imp in zip(self._feature_names, imps):
+            val = float(features_dict.get(name, 0) or 0)
+            contribution = float(imp) * abs(val)
+            scored.append((name, val, float(imp), contribution))
+        scored.sort(key=lambda x: x[3], reverse=True)
+        if scored and scored[0][3] == 0.0:
+            scored.sort(key=lambda x: x[2], reverse=True)
+        out = []
+        for name, val, imp, contrib in scored[:top_k]:
+            out.append(
+                {
+                    "name": name,
+                    "value": val,
+                    "importance": imp,
+                    "contribution_score": contrib,
+                }
+            )
+        return out
+
+    def top_critical_features(
+        self, features_dict: dict[str, Any], top_k: int = 3
+    ) -> list[dict[str, Any]]:
+        """Public alias for top contributing features (use when fraud class is already predicted).
+
+        Args:
+            features_dict: Feature map for the transaction under review.
+            top_k: How many features to return.
+
+        Returns:
+            Top-*k* features by contribution heuristic.
+        """
+        return self._top_critical_features(features_dict, top_k=top_k)
 
     def fetch_goplus_security(self, address: str) -> tuple[bool, dict[str, Any]]:
         """Query GoPlus address security and derive a blacklist boolean from flag fields.
@@ -142,14 +223,16 @@ class ThreatDetectionAgent:
             )
             return False
 
-    def check_anomaly(self, features_dict: dict[str, Any]) -> bool:
-        """Run the Random Forest classifier on a single feature row.
+    def check_anomaly(
+        self, features_dict: dict[str, Any]
+    ) -> tuple[bool, list[dict[str, Any]] | None]:
+        """Run the Random Forest classifier and compute XAI drivers when fraud is predicted.
 
         Args:
             features_dict: Mapping from feature column name to numeric value.
 
         Returns:
-            ``True`` if the model predicts the fraud class (label 1).
+            ``(is_anomaly, top_features)`` where ``top_features`` is ``None`` if prediction is not fraud.
 
         Raises:
             ValueError: Propagated by pandas/sklearn if the feature set is invalid (unexpected in normal UI use).
@@ -160,16 +243,22 @@ class ThreatDetectionAgent:
         }
         df = pd.DataFrame([row], columns=self._feature_names)
         pred = int(self._model.predict(df)[0])
-        return pred == 1
+        if pred != 1:
+            return False, None
+        return True, self._top_critical_features(features_dict, top_k=3)
 
     def generate_llm_warning_detailed(
-        self, address: str, threat_reason: str
+        self,
+        address: str,
+        threat_reason: str,
+        xai_features: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Build a Groq chat completion with a structured security prompt.
 
         Args:
             address: Wallet address shown in the advisory.
             threat_reason: Human-readable reason from Layer 1 or 2.
+            xai_features: Optional top Random Forest features (name, value, importance) for data-driven text.
 
         Returns:
             Dict with keys ``content`` (advisory text), ``groq_raw`` (API payload or error stub),
@@ -178,13 +267,31 @@ class ThreatDetectionAgent:
         Raises:
             Nothing: Failures produce user-visible fallback strings instead of raising.
         """
+        xai_block = ""
+        if xai_features:
+            lines = []
+            for item in xai_features:
+                lines.append(
+                    f"- Feature '{item['name']}': observed value={item['value']:.6g}, "
+                    f"global model importance={float(item['importance']):.6g}, "
+                    f"instance contribution score (importance×|value|)={float(item['contribution_score']):.6g}"
+                )
+            xai_block = (
+                "\n\nData-driven context from the Random Forest (instance-level XAI — top contributors):\n"
+                + "\n".join(lines)
+                + "\n\nGround your explanation in these concrete numbers: compare them to what you would "
+                "expect for a typical legitimate Ethereum wallet (e.g. unusually high send volume vs. "
+                "account/history signals). Do not use generic boilerplate; cite at least one feature by name."
+            )
+
         prompt = (
-            f"This wallet address ({address}) was flagged as risky because: {threat_reason}. "
-            "Assess the situation and write a 2-3 sentence professional cybersecurity advisory telling "
-            "the user to cancel the transaction if it still looks risky, or to approve if it does not. "
-            "For each conclusion, give a confidence score from 0 to 100: "
+            f"This wallet address ({address}) was flagged as risky because: {threat_reason}.{xai_block}\n\n"
+            "Write a concise professional cybersecurity advisory (2–4 sentences) that is explicitly "
+            "informed by the data above when XAI context is present. "
+            "Tell the user whether to cancel the transaction if risk remains credible, or approve if not. "
+            "End with a confidence score 0–100 (single line: 'Confidence: XX/100') using: "
             "0-20 very low; 21-40 low; 41-60 medium; 61-80 high; 81-100 very high. "
-            "If the confidence score is 80 or above, approve the transaction; below 80, recommend cancellation."
+            "If confidence is 80+ suggest approval only if justified; below 80 recommend cancellation or manual review."
         )
 
         if self._groq is None:
@@ -218,12 +325,18 @@ class ThreatDetectionAgent:
                 text = LLM_FALLBACK_GENERIC
             return {"content": text, "groq_raw": {"error": str(e)}, "used_llm": False}
 
-    def generate_llm_warning(self, address: str, threat_reason: str) -> str:
+    def generate_llm_warning(
+        self,
+        address: str,
+        threat_reason: str,
+        xai_features: list[dict[str, Any]] | None = None,
+    ) -> str:
         """Return only the advisory text from :meth:`generate_llm_warning_detailed`.
 
         Args:
             address: Wallet address.
             threat_reason: Reason string for the model prompt.
+            xai_features: Optional XAI feature list passed to the LLM.
 
         Returns:
             Non-empty advisory or fallback message if the detailed path fails unexpectedly.
@@ -233,7 +346,9 @@ class ThreatDetectionAgent:
         """
         try:
             return str(
-                self.generate_llm_warning_detailed(address, threat_reason)["content"]
+                self.generate_llm_warning_detailed(
+                    address, threat_reason, xai_features=xai_features
+                )["content"]
             )
         except Exception:
             logger.exception("generate_llm_warning failed for address prefix=%s", address[:18])
@@ -250,7 +365,7 @@ class ThreatDetectionAgent:
 
         Returns:
             Dict with ``status`` (``\"Allow\"`` or ``\"Denied/Pending\"``), optional ``llm_warning``,
-            and ``latency_ms``.
+            ``latency_ms``, and ``xai_top_features`` when ML anomaly fires.
 
         Raises:
             Nothing under normal API/ML failure modes; ML errors could propagate from :meth:`check_anomaly`.
@@ -258,7 +373,10 @@ class ThreatDetectionAgent:
         t0 = time.perf_counter()
 
         blacklisted = self.check_blacklist(address)
-        anomalous = False if blacklisted else self.check_anomaly(features_dict)
+        if blacklisted:
+            anomalous, xai_top = False, None
+        else:
+            anomalous, xai_top = self.check_anomaly(features_dict)
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -268,22 +386,26 @@ class ThreatDetectionAgent:
                     "GoPlus blacklist / security flags "
                     "(phishing, malicious behavior, or theft risk)"
                 )
+                xai_for_llm: list[dict[str, Any]] | None = None
             else:
                 reason = "machine-learning-based anomaly score"
+                xai_for_llm = xai_top
 
-            llm_text = self.generate_llm_warning(address, reason)
+            llm_text = self.generate_llm_warning(address, reason, xai_features=xai_for_llm)
             latency_ms = (time.perf_counter() - t0) * 1000.0
 
             return {
                 "status": "Denied/Pending",
                 "llm_warning": llm_text,
                 "latency_ms": round(latency_ms, 2),
+                "xai_top_features": xai_top,
             }
 
         return {
             "status": "Allow",
             "llm_warning": None,
             "latency_ms": round(latency_ms, 2),
+            "xai_top_features": None,
         }
 
 

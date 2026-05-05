@@ -44,6 +44,8 @@ A **Web3 transaction threat-detection** demo built as a Streamlit dashboard. It 
    pip install -r requirements.txt
    ```
 
+   This includes **Plotly** for dashboards in `app.py`.
+
 3. **Dataset and model artifacts**
 
    - Add **`data/transaction_dataset.csv`** (Ethereum fraud-style dataset with a `FLAG` column and numeric features). The training script expects the same layout used when the project was developed.
