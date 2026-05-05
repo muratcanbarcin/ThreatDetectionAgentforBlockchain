@@ -1,5 +1,5 @@
 """
-Phase 1: train a Random Forest on the Ethereum fraud detection dataset.
+Catch Theft — Phase 1: train a Random Forest on the Ethereum fraud detection dataset.
 Outputs under ``models/``: rf_model.pkl (pipeline: median imputation + RF), model_features.pkl (feature order).
 """
 

@@ -1,5 +1,5 @@
 """
-Hybrid Detection Engine: GoPlus blacklist + Random Forest anomaly scoring + Groq advisory.
+Catch Theft — hybrid detection: GoPlus rule layer + Random Forest anomaly scoring + Groq advisory.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def _classifier_from_pipeline(model: Any) -> Any:
 
 
 class ThreatDetectionAgent:
-    """Coordinates GoPlus lookups, Random Forest scoring, and optional Groq text generation."""
+    """Catch Theft core agent: GoPlus lookups, Random Forest scoring, and optional Groq text generation."""
 
     def __init__(self) -> None:
         """Load the serialized Random Forest pipeline and feature name order from disk.
@@ -277,10 +277,10 @@ class ThreatDetectionAgent:
                     f"instance contribution score (importance×|value|)={float(item['contribution_score']):.6g}"
                 )
             xai_block = (
-                "\n\nData-driven context from the Random Forest (instance-level XAI — top contributors):\n"
+                "\n\nData-driven context from the Random Forest (instance-level XAI - top contributors):\n"
                 + "\n".join(lines)
                 + "\n\nGround your explanation in these concrete numbers: compare them to what you would "
-                "expect for a typical legitimate Ethereum wallet (e.g. unusually high send volume vs. "
+                "expect for a typical legitimate on-chain wallet (e.g. unusually high send volume vs. "
                 "account/history signals). Do not use generic boilerplate; cite at least one feature by name."
             )
 

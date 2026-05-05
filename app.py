@@ -1,17 +1,19 @@
 """
-Web3 Threat Detection — security dashboard aligned with a 45-dimensional feature vector.
+Catch Theft — transaction threat-detection dashboard using a 45-dimensional feature vector.
 """
 
 from __future__ import annotations
 
 import html
-import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+import fpdf
 import pandas as pd
+from fpdf import FPDF
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -232,9 +234,9 @@ def render_sidebar(agent: ThreatDetectionAgent) -> None:
             logger.warning(
                 "Failed to render sidebar logo from %s", LOGO_PATH, exc_info=True
             )
-            st.markdown("### MIDDLEWARE LOGO")
+            st.markdown("### Catch Theft")
     else:
-        st.markdown("### MIDDLEWARE LOGO")
+        st.markdown("### Catch Theft")
 
     st.markdown("### Demo Scenarios")
     st.caption(
@@ -290,10 +292,11 @@ def render_sidebar(agent: ThreatDetectionAgent) -> None:
                 )
 
     st.divider()
-    st.markdown("### About Middleware")
+    st.markdown("### About Catch Theft")
     st.markdown(
-        "This agent acts as a secure API bridge between Cryptocurrency Exchanges and End-Users. "
-        "It intercepts transaction intents in real-time to provide a critical security layer before signing."
+        "**Catch Theft** is a real-time transaction screening layer between trading venues and end users. "
+        "It evaluates transfer intent before signing so scams and anomalies are caught earlier, with "
+        "explainable ML and optional LLM-backed briefings."
     )
 
 
@@ -335,6 +338,202 @@ def _radar_series(
         cur.append(float(abs(c) / m))
         bas.append(float(abs(b) / m))
     return cur, bas
+
+
+def _report_address_suffix(address: str) -> str:
+    """Last 4 alphanumeric characters of *address* for filename (uppercased)."""
+    alnum = "".join(c for c in (address or "").strip() if c.isalnum())
+    if len(alnum) >= 4:
+        return alnum[-4:].upper()
+    return (alnum.upper() if alnum else "0000")
+
+
+def _pdf_safe_text(value: str | None) -> str:
+    """Make text safe for PDF core fonts (Helvetica): Latin-1 subset only."""
+    if value is None:
+        return ""
+    t = str(value)
+    for a, b in (
+        ("\u2014", "-"),
+        ("\u2013", "-"),
+        ("\u2019", "'"),
+        ("\u2018", "'"),
+        ("\u2032", "'"),
+        ("\u2026", "..."),
+        ("\u200b", ""),
+        ("\ufeff", ""),
+        ("\u26a0\ufe0f", "[!] "),
+        ("\u26a0", "[!] "),
+    ):
+        t = t.replace(a, b)
+    return t.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def generate_pdf_report(
+    address: str,
+    verdict: str,
+    confidence: float,
+    latency: float | int,
+    xai_features: list[dict[str, Any]] | None,
+    llm_report: str | None,
+) -> bytes:
+    """Build a compliance-style threat report PDF and return raw bytes.
+
+    Args:
+        address: Wallet address under review.
+        verdict: Final Catch Theft verdict string.
+        confidence: Model confidence score for the predicted class (percentage).
+        latency: End-to-end scan latency in milliseconds.
+        xai_features: Top contributing features from XAI, if any.
+        llm_report: Raw advisory text from the LLM layer.
+
+    Returns:
+        PDF document as bytes suitable for ``st.download_button``.
+    """
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_margins(18, 18, 18)
+
+    font_dir = Path(fpdf.__file__).resolve().parent / "font"
+    body_font = "Helvetica"
+    try:
+        dejavu_r = font_dir / "DejaVuSans.ttf"
+        dejavu_b = font_dir / "DejaVuSans-Bold.ttf"
+        if dejavu_r.is_file():
+            pdf.add_font("DejaVu", "", str(dejavu_r))
+            if dejavu_b.is_file():
+                pdf.add_font("DejaVu", "B", str(dejavu_b))
+            body_font = "DejaVu"
+    except (OSError, ValueError):
+        body_font = "Helvetica"
+
+    pdf.add_page()
+
+    # Header
+    pdf.set_font(body_font, "B", 20)
+    pdf.set_text_color(24, 24, 24)
+    pdf.cell(
+        0,
+        12,
+        _pdf_safe_text("CATCH THEFT THREAT INTELLIGENCE REPORT"),
+        align="C",
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+    pdf.set_draw_color(200, 160, 40)
+    pdf.set_line_width(0.4)
+    pdf.line(18, pdf.get_y(), 192, pdf.get_y())
+    pdf.ln(6)
+
+    pdf.set_font(body_font, "", 9)
+    pdf.set_text_color(80, 80, 80)
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    pdf.cell(0, 5, _pdf_safe_text(f"Document generated: {generated}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        0,
+        5,
+        _pdf_safe_text(
+            "Classification: CONFIDENTIAL - Internal Security & Compliance Review"
+        ),
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+    pdf.ln(6)
+
+    # Transaction details
+    pdf.set_font(body_font, "B", 12)
+    pdf.set_text_color(0, 0, 0)
+    pdf.cell(0, 8, _pdf_safe_text("1. TRANSACTION DETAILS"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font(body_font, "", 10)
+    pdf.set_text_color(30, 30, 30)
+    pdf.cell(
+        0, 6, _pdf_safe_text(f"Wallet address: {address or 'N/A'}"), new_x="LMARGIN", new_y="NEXT"
+    )
+    pdf.cell(
+        0,
+        6,
+        _pdf_safe_text(f"Processing latency: {float(latency):,.1f} ms"),
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+    pdf.cell(
+        0,
+        6,
+        _pdf_safe_text(f"Risk / model confidence (argmax class): {float(confidence):.2f}%"),
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+    pdf.cell(0, 6, _pdf_safe_text(f"Final verdict: {verdict}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # AI advisor
+    pdf.set_font(body_font, "B", 12)
+    pdf.cell(
+        0,
+        8,
+        _pdf_safe_text("2. AI SECURITY ADVISOR (LAYER 3)"),
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+    pdf.set_font(body_font, "", 10)
+    advisory = (llm_report or "").strip() or "No LLM advisory was generated for this scan."
+    pdf.multi_cell(0, 5, _pdf_safe_text(advisory), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    # Critical flags
+    pdf.set_font(body_font, "B", 12)
+    pdf.cell(
+        0,
+        8,
+        _pdf_safe_text("3. CRITICAL FLAGS (XAI - TOP CONTRIBUTORS)"),
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+    pdf.set_font(body_font, "", 10)
+    if xai_features:
+        for i, feat in enumerate(xai_features, start=1):
+            name = str(feat.get("name", ""))
+            val = feat.get("value")
+            imp = feat.get("importance")
+            score = feat.get("contribution_score")
+            line = (
+                f"{i}. Feature: {name}\n"
+                f"   Observed value: {val} | Global importance: {imp} "
+                f"| Contribution score: {score}"
+            )
+            pdf.multi_cell(0, 5, _pdf_safe_text(line), new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(1)
+    else:
+        pdf.multi_cell(
+            0,
+            5,
+            _pdf_safe_text(
+                "No ML-derived critical feature ranking for this outcome "
+                "(e.g. verdict driven solely by rule-based blacklist, or benign classification)."
+            ),
+            new_x="LMARGIN",
+            new_y="NEXT",
+        )
+
+    pdf.ln(6)
+    pdf.set_font(body_font, "I", 8)
+    pdf.set_text_color(100, 100, 100)
+    pdf.multi_cell(
+        0,
+        4,
+        _pdf_safe_text(
+            "Disclaimer: This report is generated for operational security review. "
+            "It does not constitute legal or investment advice. "
+            "Retain in accordance with your organization's records policy."
+        ),
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+
+    raw = pdf.output(dest="S")
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw)
+    return str(raw).encode("latin-1", errors="replace")
 
 
 def _render_ai_model_analytics_tab(agent: ThreatDetectionAgent) -> None:
@@ -391,13 +590,13 @@ def _render_ai_model_analytics_tab(agent: ThreatDetectionAgent) -> None:
 
     st.markdown(
         """
-**Why False Positives are acceptable in our architecture**
+**Why False Positives are acceptable in the Catch Theft architecture**
 
-False positives flag **legitimate** traffic as suspicious. In our stack they are **preferable to false negatives**:
+False positives flag **legitimate** traffic as suspicious. In this stack they are **preferable to false negatives**:
 a false negative can mean **irreversible loss** once a malicious transaction is signed on-chain. A false positive
 only routes the user through an extra **LLM contextual review** (on the order of ~1.2s) and produces an
-auditable narrative — not an automatic fund loss. We therefore tune the Random Forest toward **high recall on fraud**
-and use **Layer 3 (Groq)** to absorb ambiguous ML scores before any final human or policy decision.
+auditable narrative - not an automatic fund loss. Catch Theft therefore tunes the Random Forest toward **high recall on fraud**
+and uses **Layer 3 (Groq)** to absorb ambiguous ML scores before any final human or policy decision.
         """
     )
 
@@ -487,16 +686,16 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
                 help="Fraudulent transactions correctly blocked.",
             )
         st.info(
-            "Trade-off Analysis: In Web3 security, False Negatives (missed scams) result in "
+            "Trade-off Analysis: For digital-asset transactions, False Negatives (missed scams) result in "
             "irreversible financial loss, whereas False Positives (false alarms) only introduce a "
-            "~1.2s delay due to the LLM contextual review. Our Random Forest model is aggressively "
-            "tuned to minimize False Negatives, offloading ambiguous cases to the LLM for final "
+            "~1.2s delay due to the LLM contextual review. Catch Theft aggressively tunes the Random Forest "
+            "to minimize False Negatives, offloading ambiguous cases to the LLM for final "
             "verification."
         )
 
     st.markdown(
-        '<div class="dash-sub">45-dimensional on-chain feature vector &rarr; GoPlus &rarr; Random Forest '
-        "(probability) &rarr; Groq. Not a black box; all inputs and outputs below are inspectable.</div>",
+        '<div class="dash-sub">Catch Theft pipeline: 45-dimensional on-chain feature vector &rarr; GoPlus &rarr; Random Forest '
+        "(probability) &rarr; Groq. Not a black box; inputs and outputs below are inspectable.</div>",
         unsafe_allow_html=True,
     )
 
@@ -654,7 +853,7 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
         mx_pct = float(max(proba) * 100.0) if proba else 0.0
 
         st.markdown(
-            '<p class="middleware-verdict-heading">Middleware Verdict</p>',
+            '<p class="catch-theft-verdict-heading">Catch Theft — Verdict</p>',
             unsafe_allow_html=True,
         )
         if v == "SAFE":
@@ -671,7 +870,7 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
                     "SAFE",
                     delta="Ready to sign",
                     delta_color="normal",
-                    help="Middleware composite verdict after GoPlus + Random Forest (+ LLM if triggered).",
+                    help="Catch Theft composite verdict after GoPlus + Random Forest (+ LLM if triggered).",
                 )
             elif v == "DANGER":
                 st.metric(
@@ -679,7 +878,7 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
                     "DANGER",
                     delta="Blacklist / critical",
                     delta_color="inverse",
-                    help="Middleware composite verdict after GoPlus + Random Forest (+ LLM if triggered).",
+                    help="Catch Theft composite verdict after GoPlus + Random Forest (+ LLM if triggered).",
                 )
             else:
                 st.metric(
@@ -687,7 +886,7 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
                     "SUSPICIOUS",
                     delta="ML anomaly",
                     delta_color="off",
-                    help="Middleware composite verdict after GoPlus + Random Forest (+ LLM if triggered).",
+                    help="Catch Theft composite verdict after GoPlus + Random Forest (+ LLM if triggered).",
                 )
         with m2:
             st.metric(
@@ -730,7 +929,7 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
             st.markdown(
                 f"""
                 <div class="advisor-risk">
-                    <div class="advisor-title">AI Security Advisor Report</div>
+                    <div class="advisor-title">Catch Theft — Advisor Report</div>
                     <div class="advisor-body">{safe_llm}</div>
                 </div>
                 """,
@@ -785,28 +984,29 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
                 )
                 st.plotly_chart(fig_r, use_container_width=True)
 
-        report_payload = {
-            "report_title": "Catch Theft Crypto Security — Threat Intelligence Report",
-            "wallet_address": snap.get("wallet_address"),
-            "verdict": snap.get("verdict"),
-            "threat_source": snap.get("threat_source"),
-            "latency_ms": snap.get("latency_ms"),
-            "risk_class_probability_pct": round(risk_pct, 4),
-            "confidence_in_argmax_class_pct": round(mx_pct, 4),
-            "xai_top_features": snap.get("xai_top_features"),
-            "llm_advisory_text": snap.get("llm_warning"),
-            "feature_vector_45": snap.get("features"),
-            "evaluate_style_summary": snap.get("raw_evaluate"),
-            "goplus_raw": snap.get("goplus_raw"),
-            "groq_raw": snap.get("groq_raw"),
-        }
+        try:
+            pdf_bytes = generate_pdf_report(
+                str(snap.get("wallet_address") or ""),
+                str(snap.get("verdict") or ""),
+                float(mx_pct),
+                float(snap.get("latency_ms") or 0.0),
+                snap.get("xai_top_features"),
+                snap.get("llm_warning"),
+            )
+            pdf_name = f"Threat_Report_{_report_address_suffix(str(snap.get('wallet_address') or ''))}.pdf"
+        except Exception:
+            logger.exception("Failed to build threat PDF report")
+            pdf_bytes = b""
+            pdf_name = "Threat_Report_error.pdf"
+
         st.download_button(
-            label="Download Threat Intel Report (JSON)",
-            data=json.dumps(report_payload, indent=2, ensure_ascii=False),
-            file_name="Threat_Intel_Report.json",
-            mime="application/json",
-            key="download_threat_intel_report_json",
+            label="Download Catch Theft Report (PDF)",
+            data=pdf_bytes,
+            file_name=pdf_name,
+            mime="application/pdf",
+            key="download_threat_intel_report_pdf",
             use_container_width=True,
+            disabled=not pdf_bytes,
         )
 
     with st.expander("Raw Model Input (45 Vector)", expanded=False):
@@ -822,7 +1022,7 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
                 st.markdown("**Random Forest input vector (45)**")
                 st.json(snap.get("features") or {})
             with cright:
-                st.markdown("**`evaluate_transaction`-style summary + raw GoPlus**")
+                st.markdown("**Catch Theft summary + raw GoPlus**")
                 st.json(
                     {
                         "evaluate_style_summary": snap.get("raw_evaluate"),
@@ -835,7 +1035,7 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
 def main() -> None:
     """Streamlit entrypoint: page chrome, sidebar, scan workflow, and results panels."""
     st.set_page_config(
-        page_title="Catch Theft Crypto Security",
+        page_title="Catch Theft",
         layout="wide",
     )
 
@@ -880,7 +1080,7 @@ def main() -> None:
             font-weight: 700 !important;
         }
         button[kind="primary"]:hover { filter: brightness(1.08); }
-        .middleware-verdict-heading { color: #F0B90B !important; font-size: 1.15rem; font-weight: 700; margin: 0.5rem 0 0.25rem 0; }
+        .catch-theft-verdict-heading { color: #F0B90B !important; font-size: 1.15rem; font-weight: 700; margin: 0.5rem 0 0.25rem 0; }
         .verdict-safe-glow {
             color: #F0B90B !important;
             font-size: 1.5rem;
@@ -912,7 +1112,7 @@ def main() -> None:
     with st.sidebar:
         render_sidebar(agent)
 
-    st.title("Catch Theft Crypto Security")
+    st.title("Catch Theft")
     tab_live, tab_analytics = st.tabs(
         ["🔍 Live Threat Analysis", "📊 AI Model Analytics"]
     )

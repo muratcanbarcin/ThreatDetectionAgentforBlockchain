@@ -1,13 +1,13 @@
-# Catch Theft Crypto Security
+# Catch Theft
 
-A **Web3 transaction threat-detection** demo built as a Streamlit dashboard. It combines a **rule-based** layer (GoPlus address security), a **Random Forest** model on a **45-dimensional** on-chain feature vector, and optional **Groq LLM** explanations when the risk pipeline fires.
+**Catch Theft** is a transaction threat-detection demo delivered as a Streamlit dashboard. It layers a **rule-based** check (GoPlus address security), a **Random Forest** on a **45-dimensional** on-chain feature vector, and optional **Groq LLM** explanations when the risk path runs.
 
 ## Features
 
 - **Layer 1 — GoPlus:** Ethereum mainnet address security flags (phishing, malicious behavior, stealing attack), with a demo mode that simulates a blacklisted address.
 - **Layer 2 — Random Forest:** Fraud vs. legitimate classification using the same numeric features the model was trained on (median imputation + sklearn pipeline).
 - **Layer 3 — Groq LLM:** Short, user-facing security advisory text when blacklist or ML anomaly triggers (requires `GROQ_API_KEY`).
-- **UI:** Scenario buttons (safe / known threat / zero-day anomaly), manual feature tuning, verdicts, latency, raw JSON payloads for inspection.
+- **UI:** Scenario buttons (safe / known threat / zero-day anomaly), manual feature tuning, verdicts, latency, XAI visuals, PDF report export, and raw payloads for inspection.
 
 ## Repository layout
 
@@ -44,7 +44,7 @@ A **Web3 transaction threat-detection** demo built as a Streamlit dashboard. It 
    pip install -r requirements.txt
    ```
 
-   This includes **Plotly** for dashboards in `app.py`.
+   This includes **Plotly** (dashboards) and **fpdf2** (PDF reports) for `app.py`.
 
 3. **Dataset and model artifacts**
 
@@ -69,7 +69,7 @@ A **Web3 transaction threat-detection** demo built as a Streamlit dashboard. It 
 
 5. **Optional logo**
 
-   Place `logo.png` in the project root to show it in the sidebar; otherwise a text placeholder is used.
+   Place `logo.png` in the project root to show it in the sidebar; otherwise a **Catch Theft** text placeholder is used.
 
 ## Run the dashboard
 
@@ -89,4 +89,4 @@ Generates bar and pie charts illustrating latency and LLM bypass/trigger rates f
 
 ## License / disclaimer
 
-This project is intended for **research, education, and demonstration**. On-chain labels and third-party APIs can be incomplete or lag real-world abuse. **Do not rely on this stack as your sole security control** for production fund custody or compliance decisions.
+Catch Theft is intended for **research, education, and demonstration**. On-chain labels and third-party APIs can be incomplete or lag real-world abuse. **Do not rely on this stack as your sole security control** for production fund custody or compliance decisions.
