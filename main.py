@@ -1,28 +1,44 @@
+"""Simulation harness: mock addresses, latency charts, and LLM bypass statistics."""
+
+from __future__ import annotations
+
+import logging
 import random
 import time
+from typing import Any
 
 import matplotlib.pyplot as plt
 import pandas as pd
 
 from mock_data import mock_addresses
 
+logger = logging.getLogger(__name__)
 
-def rule_based_filter(address_data):
-    """
-    Returns True if the address appears on a blacklist (threat present).
+
+def rule_based_filter(address_data: dict[str, Any]) -> bool:
+    """Return True when the mock record marks the address as OSINT-blacklisted.
+
+    Args:
+        address_data: Mock wallet payload including ``in_osint_blacklist``.
+
+    Returns:
+        ``True`` if a blacklist flag is set.
     """
     if address_data.get("in_osint_blacklist") is True:
         return True
     return False
 
 
-def ml_anomaly_detection(address_data):
-    """
-    Checks transaction-history anomalies (e.g. zero-value bursts, sudden volume spikes).
-    Returns True when anomaly heuristics fire.
+def ml_anomaly_detection(address_data: dict[str, Any]) -> bool:
+    """Apply simple heuristics (volume spike, zero-value spam) on mock features.
+
+    Args:
+        address_data: Mock payload with ``transaction_features``.
+
+    Returns:
+        ``True`` if heuristic thresholds indicate an anomaly.
     """
     features = address_data.get("transaction_features", {})
-    # Simple threshold-style ML simulation
     is_spike = features.get("sudden_volume_spike", False)
     high_zero_value = features.get("zero_value_tx_1h", 0) > 10
 
@@ -31,22 +47,30 @@ def ml_anomaly_detection(address_data):
     return False
 
 
-def trigger_llm(address_data):
+def trigger_llm(address_data: dict[str, Any]) -> str:
+    """Sleep to mimic LLM latency, then return a canned analysis string.
+
+    Args:
+        address_data: Unused; kept for API symmetry with a real LLM call.
+
+    Returns:
+        Simulated LLM output text.
     """
-    Simulates local LLM analysis with a 1.2s delay and returns a security summary string.
-    """
+    del address_data  # placeholder for future use
     time.sleep(1.2)
     return (
         "LLM analysis complete: high-risk, inconsistent transaction pattern detected."
     )
 
 
-def evaluate_transaction(address_data):
-    """
-    Main decision flow:
-    1. Rule-based filter and anomaly detection run first.
-    2. If a threat is found, the LLM runs (Pending/Denied).
-    3. Otherwise the LLM is skipped (Bypass / Allow).
+def evaluate_transaction(address_data: dict[str, Any]) -> dict[str, Any]:
+    """Run rule + mock-ML stages and optionally trigger the fake LLM path.
+
+    Args:
+        address_data: One entry from ``mock_addresses``.
+
+    Returns:
+        Dict with ``decision``, ``llm_triggered``, and ``llm_response``.
     """
     is_rule_broken = rule_based_filter(address_data)
     is_anomaly_detected = ml_anomaly_detection(address_data)
@@ -60,11 +84,11 @@ def evaluate_transaction(address_data):
         llm_response = trigger_llm(address_data)
 
         if is_rule_broken:
-            decision = "Denied"  # Hard rule violation
+            decision = "Denied"
         else:
-            decision = "Pending"  # Suspicious but not a hard deny
+            decision = "Pending"
     else:
-        decision = "Allow"  # Clean path — LLM skipped
+        decision = "Allow"
 
     return {
         "decision": decision,
@@ -73,17 +97,20 @@ def evaluate_transaction(address_data):
     }
 
 
-def visualize_latency(df):
-    """
-    Reads latency values from a pandas DataFrame and plots a Matplotlib bar chart.
+def visualize_latency(df: pd.DataFrame) -> None:
+    """Plot per-scenario latency bars and save ``latency_chart.png``.
+
+    Args:
+        df: DataFrame containing ``Scenario Type`` and ``Latency (ms)`` columns.
+
+    Returns:
+        None
     """
     plt.figure(figsize=(9, 6))
 
-    # Parse strings like "1200.00 ms" into floats
     latencies = df["Latency (ms)"].str.replace(" ms", "").astype(float)
     scenarios = df["Scenario Type"]
 
-    # Colors: Safe -> green, Malicious -> red, Zero-day -> orange
     colors = ["#2ca02c", "#d62728", "#ff7f0e"]
 
     bars = plt.bar(scenarios, latencies, color=colors, edgecolor="black", alpha=0.8)
@@ -113,20 +140,20 @@ def visualize_latency(df):
 
     plt.savefig("latency_chart.png", dpi=300, bbox_inches="tight")
     plt.close()
-    print("\n[+] First chart saved as 'latency_chart.png'.")
+    logger.info("First chart saved as 'latency_chart.png'.")
 
 
-def load_test_and_visualize():
+def load_test_and_visualize() -> None:
+    """Run 100 mock transactions and save a pie chart of LLM bypass vs trigger.
+
+    Returns:
+        None
     """
-    Runs a 100-transaction load test to show how often the LLM is bypassed
-    (resource / latency optimization).
-    """
-    print("\n[!] Starting 100-transaction load test...")
-    print(
-        "    Note: simulation may wait ~24s total for LLM paths. Please wait..."
+    logger.info("Starting 100-transaction load test...")
+    logger.info(
+        "Note: simulation may wait ~24s total for LLM paths. Please wait..."
     )
 
-    # Batch: 80% Safe, 10% Malicious, 10% Zero-day
     batch = []
     batch.extend([mock_addresses[0]] * 80)
     batch.extend([mock_addresses[1]] * 10)
@@ -152,7 +179,7 @@ def load_test_and_visualize():
 
     plt.figure(figsize=(8, 6))
 
-    def custom_autopct(pct, allvals):
+    def custom_autopct(pct: float, allvals: list[int]) -> str:
         absolute = int(round(pct / 100.0 * sum(allvals)))
         return f"{absolute} Transactions\n({pct:.1f}%)"
 
@@ -181,11 +208,13 @@ def load_test_and_visualize():
     plt.savefig("resource_chart.png", dpi=300, bbox_inches="tight")
     plt.close()
 
-    print("[+] Load test finished. Chart saved as 'resource_chart.png'.")
+    logger.info("Load test finished. Chart saved as 'resource_chart.png'.")
 
 
-def run_tests():
-    print("Starting system...\nLoading modules and rules...\n")
+def run_tests() -> None:
+    """Execute scenario loop, log results table, and produce both charts."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    logger.info("Starting system... Loading modules and rules...")
     results = []
     scenario_names = ["Safe Address", "Known Malicious", "Zero-Day Suspicious"]
 
@@ -210,8 +239,7 @@ def run_tests():
 
     df = pd.DataFrame(results)
 
-    print("--- SIMULATION TEST RESULTS ---")
-    print(df.to_string(index=False))
+    logger.info("--- SIMULATION TEST RESULTS ---\n%s", df.to_string(index=False))
 
     visualize_latency(df)
     load_test_and_visualize()

@@ -4,28 +4,61 @@ Hybrid Detection Engine: GoPlus blacklist + Random Forest anomaly scoring + Groq
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
 import joblib
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 from groq import Groq
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
-MODEL_PATH = ROOT / "rf_model.pkl"
-FEATURES_PATH = ROOT / "model_features.pkl"
+
+MODELS_DIR = ROOT / "models"
+MODEL_PATH = MODELS_DIR / "rf_model.pkl"
+FEATURES_PATH = MODELS_DIR / "model_features.pkl"
 GOPLUS_TEMPLATE = (
     "https://api.gopluslabs.io/api/v1/address_security/{address}?chain_id=1"
 )
+GOPLUS_TIMEOUT_SEC = 15
+
+logger = logging.getLogger(__name__)
+
+LLM_FALLBACK_TIMEOUT = (
+    "⚠️ LLM Contextual Analysis is currently unavailable due to network timeout."
+)
+LLM_FALLBACK_GENERIC = (
+    "⚠️ LLM Contextual Analysis is currently unavailable due to a network or "
+    "service error."
+)
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """Return True if *exc* represents a timeout-style failure from HTTP or SDK clients."""
+    if isinstance(exc, TimeoutError):
+        return True
+    et = type(exc).__name__.lower()
+    if "timeout" in et:
+        return True
+    msg = str(exc).lower()
+    return "timeout" in msg or "timed out" in msg
 
 
 class ThreatDetectionAgent:
+    """Coordinates GoPlus lookups, Random Forest scoring, and optional Groq text generation."""
+
     def __init__(self) -> None:
+        """Load the serialized Random Forest pipeline and feature name order from disk.
+
+        Raises:
+            FileNotFoundError: If ``models/rf_model.pkl`` or ``models/model_features.pkl`` is missing.
+            OSError: If model files cannot be read.
+        """
         self._model = joblib.load(MODEL_PATH)
         self._feature_names: list[str] = list(joblib.load(FEATURES_PATH))
 
@@ -33,15 +66,48 @@ class ThreatDetectionAgent:
         self._groq: Groq | None = Groq(api_key=api_key) if api_key else None
 
     def fetch_goplus_security(self, address: str) -> tuple[bool, dict[str, Any]]:
-        """Full GoPlus API JSON response and blacklist decision (for UI / logging)."""
+        """Query GoPlus address security and derive a blacklist boolean from flag fields.
+
+        Args:
+            address: Ethereum ``0x`` address (mainnet in template URL).
+
+        Returns:
+            Tuple of ``(blacklisted, payload_or_error_dict)``. On transport/HTTP errors,
+            ``blacklisted`` is ``False`` and the second element contains ``error`` and ``source`` keys.
+
+        Raises:
+            Nothing: Errors are swallowed and returned as structured dicts for UI stability.
+        """
         url = GOPLUS_TEMPLATE.format(address=address)
         try:
-            resp = requests.get(url, timeout=15)
+            resp = requests.get(url, timeout=GOPLUS_TIMEOUT_SEC)
+            if resp.status_code >= 500:
+                logger.error(
+                    "GoPlus server error %s for address prefix=%s",
+                    resp.status_code,
+                    (address[:18] + "…") if len(address) > 18 else address,
+                )
+                return False, {
+                    "error": f"HTTP {resp.status_code} from GoPlus",
+                    "source": "goplus_http",
+                }
             resp.raise_for_status()
             payload: dict[str, Any] = resp.json()
+        except requests.Timeout:
+            logger.warning(
+                "GoPlus request timed out after %ss (address prefix=%s)",
+                GOPLUS_TIMEOUT_SEC,
+                (address[:18] + "…") if len(address) > 18 else address,
+            )
+            return False, {"error": "Request timed out", "source": "goplus_http"}
+        except requests.HTTPError as e:
+            logger.warning("GoPlus HTTP error: %s", e)
+            return False, {"error": str(e), "source": "goplus_http"}
         except requests.RequestException as e:
+            logger.warning("GoPlus request failed: %s", e)
             return False, {"error": str(e), "source": "goplus_http"}
         except ValueError as e:
+            logger.warning("GoPlus JSON decode error: %s", e)
             return False, {"error": str(e), "source": "goplus_json"}
 
         result = payload.get("result") or {}
@@ -54,10 +120,40 @@ class ThreatDetectionAgent:
         return threat, payload
 
     def check_blacklist(self, address: str) -> bool:
-        threat, _payload = self.fetch_goplus_security(address)
-        return threat
+        """Return True if GoPlus reports phishing/malicious/stealing flags for this address.
+
+        Args:
+            address: Wallet address to check.
+
+        Returns:
+            ``True`` if any relevant GoPlus flag is set; ``False`` on safe result or any failure
+            (fail-open to avoid blocking traffic when the API is down).
+
+        Raises:
+            Nothing.
+        """
+        try:
+            threat, _payload = self.fetch_goplus_security(address)
+            return threat
+        except Exception:
+            logger.exception(
+                "Unexpected error in check_blacklist for address prefix=%s",
+                (address[:18] + "…") if len(address) > 18 else address,
+            )
+            return False
 
     def check_anomaly(self, features_dict: dict[str, Any]) -> bool:
+        """Run the Random Forest classifier on a single feature row.
+
+        Args:
+            features_dict: Mapping from feature column name to numeric value.
+
+        Returns:
+            ``True`` if the model predicts the fraud class (label 1).
+
+        Raises:
+            ValueError: Propagated by pandas/sklearn if the feature set is invalid (unexpected in normal UI use).
+        """
         row = {
             name: float(features_dict.get(name, 0) or 0)
             for name in self._feature_names
@@ -69,6 +165,19 @@ class ThreatDetectionAgent:
     def generate_llm_warning_detailed(
         self, address: str, threat_reason: str
     ) -> dict[str, Any]:
+        """Build a Groq chat completion with a structured security prompt.
+
+        Args:
+            address: Wallet address shown in the advisory.
+            threat_reason: Human-readable reason from Layer 1 or 2.
+
+        Returns:
+            Dict with keys ``content`` (advisory text), ``groq_raw`` (API payload or error stub),
+            and ``used_llm`` (bool).
+
+        Raises:
+            Nothing: Failures produce user-visible fallback strings instead of raising.
+        """
         prompt = (
             f"This wallet address ({address}) was flagged as risky because: {threat_reason}. "
             "Assess the situation and write a 2-3 sentence professional cybersecurity advisory telling "
@@ -83,6 +192,7 @@ class ThreatDetectionAgent:
                 "Warning: GROQ_API_KEY is not set; LLM is disabled. "
                 f"For address {address}, {threat_reason} was detected; canceling the transaction is recommended."
             )
+            logger.info("Groq client unavailable (no API key); returning static advisory.")
             return {"content": text, "groq_raw": None, "used_llm": False}
 
         try:
@@ -100,18 +210,51 @@ class ThreatDetectionAgent:
             )
             return {"content": text, "groq_raw": raw, "used_llm": True}
         except Exception as e:
-            text = (
-                "Warning: Groq request failed (network or quota). "
-                f"For address {address}, {threat_reason} was detected; canceling the transaction is recommended."
-            )
+            if _is_timeout_error(e):
+                logger.warning("Groq request timed out: %s", e)
+                text = LLM_FALLBACK_TIMEOUT
+            else:
+                logger.error("Groq request failed: %s", e, exc_info=True)
+                text = LLM_FALLBACK_GENERIC
             return {"content": text, "groq_raw": {"error": str(e)}, "used_llm": False}
 
     def generate_llm_warning(self, address: str, threat_reason: str) -> str:
-        return str(self.generate_llm_warning_detailed(address, threat_reason)["content"])
+        """Return only the advisory text from :meth:`generate_llm_warning_detailed`.
+
+        Args:
+            address: Wallet address.
+            threat_reason: Reason string for the model prompt.
+
+        Returns:
+            Non-empty advisory or fallback message if the detailed path fails unexpectedly.
+
+        Raises:
+            Nothing.
+        """
+        try:
+            return str(
+                self.generate_llm_warning_detailed(address, threat_reason)["content"]
+            )
+        except Exception:
+            logger.exception("generate_llm_warning failed for address prefix=%s", address[:18])
+            return LLM_FALLBACK_GENERIC
 
     def evaluate_transaction(
         self, address: str, features_dict: dict[str, Any]
     ) -> dict[str, Any]:
+        """End-to-end single-transaction evaluation (GoPlus + RF + conditional LLM).
+
+        Args:
+            address: On-chain address under review.
+            features_dict: Numeric features aligned with training column order.
+
+        Returns:
+            Dict with ``status`` (``\"Allow\"`` or ``\"Denied/Pending\"``), optional ``llm_warning``,
+            and ``latency_ms``.
+
+        Raises:
+            Nothing under normal API/ML failure modes; ML errors could propagate from :meth:`check_anomaly`.
+        """
         t0 = time.perf_counter()
 
         blacklisted = self.check_blacklist(address)
@@ -147,7 +290,23 @@ class ThreatDetectionAgent:
 def _fraud_profile_for_demo(
     feature_names: list[str], model: Any, max_tweaks: int = 12
 ) -> dict[str, float]:
-    """Fill a zero mock vector from FLAG=1 sample columns until RF predicts class 1."""
+    """Construct a feature vector that triggers fraud prediction for UI demos.
+
+    Starting from zeros, progressively copies the strongest values from one known
+    fraud row until ``model`` predicts class 1.
+
+    Args:
+        feature_names: Ordered list of column names expected by the trained model.
+        model: Fitted sklearn-compatible estimator with ``predict``.
+        max_tweaks: Initial number of features to copy from the fraud profile.
+
+    Returns:
+        Feature dict that yields a positive (fraud) prediction, or the full fraud profile.
+
+    Raises:
+        FileNotFoundError: If ``data/transaction_dataset.csv`` does not exist.
+        KeyError: If required columns are missing from the dataset.
+    """
     csv_path = ROOT / "data" / "transaction_dataset.csv"
     if not csv_path.is_file():
         raise FileNotFoundError(f"Dataset not found for demo: {csv_path}")
@@ -193,6 +352,7 @@ def _fraud_profile_for_demo(
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     from unittest.mock import patch
 
     agent = ThreatDetectionAgent()
@@ -200,27 +360,26 @@ if __name__ == "__main__":
 
     safe_features: dict[str, float] = {name: 0.0 for name in features}
     try:
-        # Zero vector plus strong columns from a FLAG=1 training row until RF predicts 1
         anomalous_features = _fraud_profile_for_demo(features, agent._model)
     except FileNotFoundError as e:
-        print(f"[Warning] Anomaly demo: {e}")
+        logger.warning("Anomaly demo profile unavailable: %s", e)
         anomalous_features = dict(safe_features)
 
     vitalik = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
     tether = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
 
-    print("=== Scenario 1: Safe (clean address + zero features) ===")
-    print(agent.evaluate_transaction(vitalik, safe_features))
+    logger.info("=== Scenario 1: Safe (clean address + zero features) ===")
+    logger.info("%s", agent.evaluate_transaction(vitalik, safe_features))
 
-    print("\n=== Scenario 2: Blacklisted (simulated check_blacklist=True instead of GoPlus) ===")
+    logger.info("=== Scenario 2: Blacklisted (simulated check_blacklist=True) ===")
     fake_phishing = "0x0000000000000000000000000000000000000bad"
     with patch.object(ThreatDetectionAgent, "check_blacklist", return_value=True):
-        print(agent.evaluate_transaction(fake_phishing, safe_features))
+        logger.info("%s", agent.evaluate_transaction(fake_phishing, safe_features))
 
-    print("\n=== Scenario 3: Anomaly (safe address + fraud-pattern features) ===")
-    print(agent.evaluate_transaction(vitalik, anomalous_features))
+    logger.info("=== Scenario 3: Anomaly (safe address + fraud-pattern features) ===")
+    logger.info("%s", agent.evaluate_transaction(vitalik, anomalous_features))
 
-    print(
-        "\n=== Extra: Tether contract + zero features (live GoPlus; may not be blacklisted) ==="
+    logger.info(
+        "=== Extra: Tether contract + zero features (live GoPlus; may not be blacklisted) ==="
     )
-    print(agent.evaluate_transaction(tether, safe_features))
+    logger.info("%s", agent.evaluate_transaction(tether, safe_features))

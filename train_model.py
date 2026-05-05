@@ -1,10 +1,11 @@
 """
 Phase 1: train a Random Forest on the Ethereum fraud detection dataset.
-Outputs: rf_model.pkl (pipeline: median imputation + RF), model_features.pkl (feature order).
+Outputs under ``models/``: rf_model.pkl (pipeline: median imputation + RF), model_features.pkl (feature order).
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import joblib
@@ -18,14 +19,27 @@ from sklearn.pipeline import Pipeline
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = ROOT / "data" / "transaction_dataset.csv"
-MODEL_PATH = ROOT / "rf_model.pkl"
-FEATURES_PATH = ROOT / "model_features.pkl"
+MODELS_DIR = ROOT / "models"
+MODEL_PATH = MODELS_DIR / "rf_model.pkl"
+FEATURES_PATH = MODELS_DIR / "model_features.pkl"
+
+logger = logging.getLogger(__name__)
 
 
 def load_and_clean_data(csv_path: Path) -> tuple[pd.DataFrame, pd.Series]:
+    """Load CSV, normalize headers, drop id columns, and return numeric features with labels.
+
+    Args:
+        csv_path: Path to ``transaction_dataset.csv``.
+
+    Returns:
+        ``(X, y)`` where ``X`` is numeric features only and ``y`` is the ``FLAG`` column.
+
+    Raises:
+        KeyError: If ``FLAG`` is missing from the dataframe.
+    """
     df = pd.read_csv(csv_path)
 
-    # Normalize column names (leading/trailing/double spaces)
     df.columns = df.columns.str.strip().str.replace(r"\s+", " ", regex=True)
 
     drop_id_cols = []
@@ -41,7 +55,6 @@ def load_and_clean_data(csv_path: Path) -> tuple[pd.DataFrame, pd.Series]:
     y = df["FLAG"]
     X = df.drop(columns=["FLAG"])
 
-    # Drop non-numeric ERC20 text columns (numeric ERC20 stats remain)
     erc20_text_cols = [
         c
         for c in X.columns
@@ -50,13 +63,16 @@ def load_and_clean_data(csv_path: Path) -> tuple[pd.DataFrame, pd.Series]:
     if erc20_text_cols:
         X = X.drop(columns=erc20_text_cols)
 
-    # Numeric features only
     X = X.select_dtypes(include=[np.number])
 
     return X, y
 
 
 def main() -> None:
+    """Train the pipeline, log metrics, and persist artifacts under ``models/``."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
     X, y = load_and_clean_data(DATA_PATH)
     feature_names = list(X.columns)
 
@@ -68,7 +84,6 @@ def main() -> None:
         stratify=y,
     )
 
-    # Missing values: median imputer fit on train only (no leakage)
     model = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
@@ -87,14 +102,13 @@ def main() -> None:
     y_pred = model.predict(X_test)
 
     acc = accuracy_score(y_test, y_pred)
-    print(f"Accuracy Score: {acc:.6f}")
-    print("Classification Report:")
-    print(classification_report(y_test, y_pred, digits=4))
+    logger.info("Accuracy Score: %.6f", acc)
+    logger.info("Classification Report:\n%s", classification_report(y_test, y_pred, digits=4))
 
     joblib.dump(model, MODEL_PATH)
     joblib.dump(feature_names, FEATURES_PATH)
-    print(f"Model saved: {MODEL_PATH}")
-    print(f"Feature list saved: {FEATURES_PATH} ({len(feature_names)} features)")
+    logger.info("Model saved: %s", MODEL_PATH)
+    logger.info("Feature list saved: %s (%d features)", FEATURES_PATH, len(feature_names))
 
 
 if __name__ == "__main__":

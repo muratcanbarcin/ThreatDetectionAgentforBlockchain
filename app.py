@@ -5,6 +5,7 @@ Web3 Threat Detection — security dashboard aligned with a 45-dimensional featu
 from __future__ import annotations
 
 import html
+import logging
 import time
 from pathlib import Path
 from typing import Any, Literal
@@ -33,15 +34,33 @@ PRIMARY_FIELDS: list[tuple[str, str]] = [
 
 PRIMARY_COLS = {col for _lb, col in PRIMARY_FIELDS}
 
+logger = logging.getLogger(__name__)
+
 
 @st.cache_resource
 def get_agent() -> ThreatDetectionAgent:
+    """Load and cache the threat agent (model + feature names) for the Streamlit process.
+
+    Returns:
+        Shared :class:`~middleware.ThreatDetectionAgent` instance.
+    """
     return ThreatDetectionAgent()
 
 
 @st.cache_data(show_spinner=False)
 def _profile_from_dataset(flag: Literal[0, 1], feature_names: tuple[str, ...]) -> dict[str, float]:
-    """Full 45 features from the training CSV for FLAG=0 (legitimate) or FLAG=1 (fraud)."""
+    """Sample one labeled row from the training CSV projected onto *feature_names*.
+
+    Args:
+        flag: ``0`` for legitimate rows, ``1`` for fraud rows.
+        feature_names: Expected column order from the trained model.
+
+    Returns:
+        Mapping of feature name to float value; if the CSV is missing, all zeros.
+
+    Note:
+        If the file exists but is malformed, pandas may raise while reading or indexing.
+    """
     if not DATA_CSV.is_file():
         return {n: 0.0 for n in feature_names}
 
@@ -69,10 +88,26 @@ def _profile_from_dataset(flag: Literal[0, 1], feature_names: tuple[str, ...]) -
 
 
 def _field_session_key(i: int) -> str:
+    """Return the ``st.session_state`` key for feature index *i*.
+
+    Args:
+        i: Index aligned with ``agent._feature_names``.
+
+    Returns:
+        Session key string ``fld_{i}``.
+    """
     return f"fld_{i}"
 
 
 def init_feature_session(names: list[str]) -> None:
+    """Ensure session state exists for wallet input, demo flags, and all feature keys.
+
+    Args:
+        names: Ordered feature column names from the loaded model.
+
+    Returns:
+        None
+    """
     if "feature_names_order" not in st.session_state:
         st.session_state.feature_names_order = list(names)
     elif list(st.session_state.feature_names_order) != list(names):
@@ -90,6 +125,14 @@ def init_feature_session(names: list[str]) -> None:
 
 
 def feature_dict_from_session(names: list[str]) -> dict[str, float]:
+    """Collect current numeric widget values into a feature dictionary.
+
+    Args:
+        names: Ordered feature names.
+
+    Returns:
+        ``{column: value}`` suitable for inference and JSON display.
+    """
     return {
         n: float(st.session_state.get(_field_session_key(i), 0.0) or 0.0)
         for i, n in enumerate(names)
@@ -97,11 +140,28 @@ def feature_dict_from_session(names: list[str]) -> dict[str, float]:
 
 
 def push_profile_to_session(names: list[str], profile: dict[str, float]) -> None:
+    """Write a pre-built profile dict into per-field session keys.
+
+    Args:
+        names: Ordered feature names.
+        profile: Values to assign (missing keys default to 0).
+
+    Returns:
+        None
+    """
     for i, n in enumerate(names):
         st.session_state[_field_session_key(i)] = float(profile.get(n, 0.0) or 0.0)
 
 
 def apply_scenario_safe(agent: ThreatDetectionAgent) -> None:
+    """Apply the benign-address scenario: safe wallet + FLAG=0-like features.
+
+    Args:
+        agent: Active detection agent (provides feature name order).
+
+    Returns:
+        None
+    """
     names = agent._feature_names
     tup = tuple(names)
     prof = _profile_from_dataset(0, tup)
@@ -111,6 +171,14 @@ def apply_scenario_safe(agent: ThreatDetectionAgent) -> None:
 
 
 def apply_scenario_known_threat(agent: ThreatDetectionAgent) -> None:
+    """Apply demo blacklist mode: threat address + simulated GoPlus skip on next scan.
+
+    Args:
+        agent: Active detection agent.
+
+    Returns:
+        None
+    """
     names = agent._feature_names
     tup = tuple(names)
     prof = _profile_from_dataset(0, tup)
@@ -120,10 +188,21 @@ def apply_scenario_known_threat(agent: ThreatDetectionAgent) -> None:
 
 
 def apply_scenario_anomaly(agent: ThreatDetectionAgent) -> None:
+    """Apply ML anomaly demo: safe address but fraud-like feature vector when possible.
+
+    Args:
+        agent: Active detection agent (model + names).
+
+    Returns:
+        None
+    """
     names = agent._feature_names
     try:
         prof = _fraud_profile_for_demo(names, agent._model)
     except FileNotFoundError:
+        logger.debug(
+            "Demo fraud profile CSV missing; using FLAG=1 sample from training CSV path."
+        )
         prof = _profile_from_dataset(1, tuple(names))
     st.session_state.ui_addr = SAFE_ADDRESS
     st.session_state.demo_force_blacklist = False
@@ -131,6 +210,14 @@ def apply_scenario_anomaly(agent: ThreatDetectionAgent) -> None:
 
 
 def render_sidebar(agent: ThreatDetectionAgent) -> None:
+    """Draw logo, demo controls, wallet field, and feature editors in the sidebar.
+
+    Args:
+        agent: Provides canonical feature ordering for inputs.
+
+    Returns:
+        None
+    """
     names = agent._feature_names
     init_feature_session(names)
 
@@ -139,6 +226,9 @@ def render_sidebar(agent: ThreatDetectionAgent) -> None:
         try:
             st.image(str(LOGO_PATH), use_container_width=True)
         except Exception:
+            logger.warning(
+                "Failed to render sidebar logo from %s", LOGO_PATH, exc_info=True
+            )
             st.markdown("### MIDDLEWARE LOGO")
     else:
         st.markdown("### MIDDLEWARE LOGO")
@@ -205,6 +295,7 @@ def render_sidebar(agent: ThreatDetectionAgent) -> None:
 
 
 def main() -> None:
+    """Streamlit entrypoint: page chrome, sidebar, scan workflow, and results panels."""
     st.set_page_config(
         page_title="Catch Theft Crypto Security",
         layout="wide",
@@ -434,6 +525,7 @@ def main() -> None:
                     proba = agent._model.predict_proba(df_row)[0].tolist()
                     pred = int(agent._model.predict(df_row)[0])
                 except Exception:
+                    logger.exception("Random Forest predict/predict_proba failed during scan")
                     proba = [0.5, 0.5]
                     pred = -1
 
