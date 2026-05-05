@@ -122,6 +122,8 @@ def init_feature_session(names: list[str]) -> None:
         st.session_state.ui_addr = SAFE_ADDRESS
     if "demo_force_blacklist" not in st.session_state:
         st.session_state.demo_force_blacklist = False
+    if "audit_logs" not in st.session_state:
+        st.session_state.audit_logs = []
 
     if "features_initialized" not in st.session_state:
         for i, _n in enumerate(names):
@@ -263,6 +265,20 @@ def render_sidebar(agent: ThreatDetectionAgent) -> None:
     st.divider()
     st.markdown("### Manual Input")
     st.text_input("Wallet address (Ethereum)", key="ui_addr")
+
+    st.markdown("### ⚙️ Middleware Configuration")
+    st.slider(
+        "Strictness Level (Anomaly Threshold)",
+        min_value=0.1,
+        max_value=0.9,
+        value=0.5,
+        step=0.01,
+        key="risk_threshold",
+        help=(
+            "Minimum fraud (class 1) probability to escalate. **Lower** = more aggressive screening; "
+            "**higher** = fewer false positives."
+        ),
+    )
 
     st.markdown("#### Key Transaction Metrics")
     for label, col in PRIMARY_FIELDS:
@@ -601,6 +617,70 @@ and uses **Layer 3 (Groq)** to absorb ambiguous ML scores before any final human
     )
 
 
+def _render_integration_audit_tab() -> None:
+    """Session audit memory, CSV export, and developer API integration examples."""
+    st.markdown("### Session Audit Trail (Memory Log)")
+    logs = list(st.session_state.get("audit_logs") or [])
+    cols = ["address", "verdict", "confidence_pct", "latency_ms", "timestamp"]
+    if logs:
+        st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
+    else:
+        st.info("No scans recorded in this session yet. Run **Analyze Transaction** on the first tab.")
+        st.dataframe(pd.DataFrame(columns=cols))
+    df_logs = pd.DataFrame(logs) if logs else pd.DataFrame(columns=cols)
+    st.download_button(
+        label="Export CSV",
+        data=df_logs.to_csv(index=False).encode("utf-8"),
+        file_name=f"catch_theft_session_audit_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        use_container_width=False,
+    )
+
+    st.divider()
+    st.markdown("### 💻 Developer API Integration")
+    st.caption(
+        "Example payloads for venues wiring Catch Theft-style screening behind their own gateways. "
+        "Endpoint is illustrative; production would use your deployed host and auth headers."
+    )
+    st.markdown("**cURL**")
+    st.code(
+        """curl -X POST https://api.threatagent.io/v1/scan \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -d '{
+    "address": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+    "risk_threshold": 0.5,
+    "features": {
+      "total transactions (including tnx to create contract": 42.0,
+      "total Ether sent": 1.25
+    }
+  }'""",
+        language="bash",
+    )
+    st.markdown("**Python (`requests`)**")
+    st.code(
+        """import requests
+
+url = "https://api.threatagent.io/v1/scan"
+payload = {
+    "address": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+    "risk_threshold": 0.5,
+    "features": {
+        "total transactions (including tnx to create contract": 42.0,
+        "total Ether sent": 1.25,
+    },
+}
+headers = {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer YOUR_API_KEY",
+}
+resp = requests.post(url, json=payload, headers=headers, timeout=30)
+resp.raise_for_status()
+print(resp.json())""",
+        language="python",
+    )
+
+
 def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> None:
     """Primary demo: methodology expander, scan workflow, verdict, XAI radar, download, raw JSON."""
     with st.expander("Multi-Layer Security Methodology", expanded=False):
@@ -713,6 +793,7 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
             fd = feature_dict_from_session(names)
             st.session_state["feature_dict"] = dict(fd)
             force_bl = bool(st.session_state.get("demo_force_blacklist"))
+            risk_thr = float(st.session_state.get("risk_threshold", 0.5))
             t0 = time.perf_counter()
 
             with st.status("Initializing Threat Engine...", expanded=True) as status:
@@ -751,7 +832,7 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
                 df_row = pd.DataFrame([fd], columns=names)
                 try:
                     proba = agent._model.predict_proba(df_row)[0].tolist()
-                    pred = int(agent._model.predict(df_row)[0])
+                    pred = int(max(range(len(proba)), key=lambda i: proba[i]))
                 except Exception:
                     logger.exception("Random Forest predict/predict_proba failed during scan")
                     proba = [0.5, 0.5]
@@ -761,8 +842,12 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
                     anomalous = False
                     xai_top: list[dict[str, Any]] | None = None
                 else:
-                    anomalous = pred == 1
-                    xai_top = agent.top_critical_features(fd) if anomalous else None
+                    fraud_p = float(proba[1]) if len(proba) > 1 else 0.0
+                    anomalous, xai_top = agent.check_anomaly(
+                        fd,
+                        risk_threshold=risk_thr,
+                        fraud_probability=fraud_p,
+                    )
 
                 threat = blacklisted or anomalous
                 llm_text: str | None = None
@@ -812,6 +897,7 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
                     "blacklisted": blacklisted,
                     "anomalous": anomalous,
                     "random_forest_prediction": pred,
+                    "risk_threshold": risk_thr,
                     "xai_top_features": xai_top,
                     "predict_proba": {"class_0_legit": proba[0], "class_1_risk": proba[1]}
                     if len(proba) > 1
@@ -833,8 +919,19 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
                     "proba": proba,
                     "blacklisted": blacklisted,
                     "anomalous": anomalous,
+                    "risk_threshold": risk_thr,
                     "xai_top_features": xai_top,
                 }
+
+                st.session_state.audit_logs.append(
+                    {
+                        "address": addr,
+                        "verdict": verdict,
+                        "confidence_pct": round(conf_pct, 2),
+                        "latency_ms": round(latency_ms, 2),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
 
                 st.session_state.demo_force_blacklist = False
 
@@ -1113,13 +1210,19 @@ def main() -> None:
         render_sidebar(agent)
 
     st.title("Catch Theft")
-    tab_live, tab_analytics = st.tabs(
-        ["🔍 Live Threat Analysis", "📊 AI Model Analytics"]
+    tab_live, tab_analytics, tab_integration = st.tabs(
+        [
+            "🔍 Live Threat Analysis",
+            "📊 AI Model Analytics",
+            "⚙️ Integration & Audit Logs",
+        ]
     )
     with tab_live:
         _render_live_threat_tab(agent, names)
     with tab_analytics:
         _render_ai_model_analytics_tab(agent)
+    with tab_integration:
+        _render_integration_audit_tab()
 
 
 if __name__ == "__main__":

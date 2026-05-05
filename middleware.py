@@ -224,26 +224,40 @@ class ThreatDetectionAgent:
             return False
 
     def check_anomaly(
-        self, features_dict: dict[str, Any]
+        self,
+        features_dict: dict[str, Any],
+        risk_threshold: float = 0.5,
+        *,
+        fraud_probability: float | None = None,
     ) -> tuple[bool, list[dict[str, Any]] | None]:
-        """Run the Random Forest classifier and compute XAI drivers when fraud is predicted.
+        """Flag anomaly when fraud (class 1) probability meets or exceeds *risk_threshold*.
+
+        Uses ``predict_proba`` (not hard ``predict``). When *fraud_probability* is provided
+        (e.g. from a shared pipeline call in the UI), the model is not queried again.
 
         Args:
             features_dict: Mapping from feature column name to numeric value.
+            risk_threshold: Minimum P(fraud) to treat as anomalous (0.0-1.0).
+            fraud_probability: Optional precomputed P(class=1); if ``None``, computed here.
 
         Returns:
-            ``(is_anomaly, top_features)`` where ``top_features`` is ``None`` if prediction is not fraud.
+            ``(is_anomaly, top_features)`` where ``top_features`` is ``None`` if below threshold.
 
         Raises:
             ValueError: Propagated by pandas/sklearn if the feature set is invalid (unexpected in normal UI use).
         """
-        row = {
-            name: float(features_dict.get(name, 0) or 0)
-            for name in self._feature_names
-        }
-        df = pd.DataFrame([row], columns=self._feature_names)
-        pred = int(self._model.predict(df)[0])
-        if pred != 1:
+        thr = float(risk_threshold)
+        if fraud_probability is not None:
+            p1 = float(fraud_probability)
+        else:
+            row = {
+                name: float(features_dict.get(name, 0) or 0)
+                for name in self._feature_names
+            }
+            df = pd.DataFrame([row], columns=self._feature_names)
+            proba = self._model.predict_proba(df)[0]
+            p1 = float(proba[1]) if len(proba) > 1 else 0.0
+        if p1 < thr:
             return False, None
         return True, self._top_critical_features(features_dict, top_k=3)
 
@@ -355,13 +369,17 @@ class ThreatDetectionAgent:
             return LLM_FALLBACK_GENERIC
 
     def evaluate_transaction(
-        self, address: str, features_dict: dict[str, Any]
+        self,
+        address: str,
+        features_dict: dict[str, Any],
+        risk_threshold: float = 0.5,
     ) -> dict[str, Any]:
         """End-to-end single-transaction evaluation (GoPlus + RF + conditional LLM).
 
         Args:
             address: On-chain address under review.
             features_dict: Numeric features aligned with training column order.
+            risk_threshold: Minimum P(fraud) from :meth:`check_anomaly` to treat as denied.
 
         Returns:
             Dict with ``status`` (``\"Allow\"`` or ``\"Denied/Pending\"``), optional ``llm_warning``,
@@ -376,7 +394,9 @@ class ThreatDetectionAgent:
         if blacklisted:
             anomalous, xai_top = False, None
         else:
-            anomalous, xai_top = self.check_anomaly(features_dict)
+            anomalous, xai_top = self.check_anomaly(
+                features_dict, risk_threshold=risk_threshold
+            )
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
