@@ -14,6 +14,7 @@ from typing import Any, Literal
 import fpdf
 import pandas as pd
 from fpdf import FPDF
+import networkx as nx
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -354,6 +355,151 @@ def _radar_series(
         cur.append(float(abs(c) / m))
         bas.append(float(abs(b) / m))
     return cur, bas
+
+
+def _network_center_label(target_address: str) -> str:
+    """Short on-graph label for the focal wallet (synthetic demo graph)."""
+    a = (target_address or "").strip()
+    if len(a) > 18:
+        return f"{a[:8]}…{a[-6:]}"
+    return a or "Target wallet"
+
+
+def generate_network_graph(target_address: str, is_threat: bool) -> go.Figure:
+    """Build a synthetic local transaction-trail-style graph for demo visualization.
+
+    Uses ``networkx.spring_layout`` and Plotly scatter traces (edges + nodes). This is a
+    **storytelling** view, not real on-chain clustering.
+
+    Args:
+        target_address: Wallet under review (shown as the graph center).
+        is_threat: If True, draw a denser high-risk motif; otherwise a benign exchange/star pattern.
+
+    Returns:
+        Plotly figure with ``template='plotly_dark'``.
+    """
+    G = nx.Graph()
+    center = _network_center_label(target_address)
+    G.add_node(center, node_role="center", threat=is_threat)
+
+    if not is_threat:
+        leaves = [
+            "Binance Hot Wallet",
+            "Coinbase",
+            "User Wallet",
+            "User Wallet 2",
+            "User Wallet 3",
+        ]
+        for name in leaves:
+            G.add_node(name, node_role="benign", threat=False)
+            G.add_edge(center, name)
+    else:
+        mix = "Tornado Cash (Mixer)"
+        phish = "Known Phishing Contract"
+        dark = "Darkweb Entity"
+        relay = "Suspicious Relay"
+        peel = "Peel Chain Node"
+        dust = "Dust / Hop Account"
+        for n in (mix, phish, dark, relay, peel, dust):
+            G.add_node(n, node_role="risk", threat=True)
+        G.add_edge(center, relay)
+        G.add_edge(center, peel)
+        G.add_edge(relay, mix)
+        G.add_edge(relay, phish)
+        G.add_edge(peel, dark)
+        G.add_edge(peel, dust)
+        G.add_edge(dust, mix)
+        G.add_edge(mix, phish)
+        G.add_edge(phish, relay)
+        G.add_edge(dark, mix)
+        G.add_edge(center, dust)
+
+    pos = nx.spring_layout(G, seed=42, k=0.9 if is_threat else 0.55, iterations=80)
+
+    edge_x: list[float | None] = []
+    edge_y: list[float | None] = []
+    ec = "#94a3b8" if is_threat else "#64748b"
+    for u, v_e in G.edges():
+        x0, y0 = pos[u]
+        x1, y1 = pos[v_e]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+    edge_trace = go.Scatter(
+        x=edge_x,
+        y=edge_y,
+        line=dict(width=1.8, color=ec),
+        hoverinfo="skip",
+        mode="lines",
+        showlegend=False,
+    )
+
+    node_x = [pos[n][0] for n in G.nodes()]
+    node_y = [pos[n][1] for n in G.nodes()]
+    colors: list[str] = []
+    sizes: list[int] = []
+    for n in G.nodes():
+        role = G.nodes[n].get("node_role", "")
+        thr = bool(G.nodes[n].get("threat", is_threat))
+        if role == "center":
+            colors.append("#f97316" if thr else "#2563eb")
+            sizes.append(28)
+        elif thr or role == "risk":
+            if "Tornado" in n:
+                colors.append("#dc2626")
+            elif "Phishing" in n:
+                colors.append("#eab308")
+            elif "Darkweb" in n:
+                colors.append("#b45309")
+            else:
+                colors.append("#9f1239")
+            sizes.append(22)
+        else:
+            if "Binance" in n:
+                colors.append("#16a34a")
+            elif "Coinbase" in n:
+                colors.append("#15803d")
+            else:
+                colors.append("#38bdf8")
+            sizes.append(20)
+
+    node_trace = go.Scatter(
+        x=node_x,
+        y=node_y,
+        mode="markers+text",
+        text=list(G.nodes()),
+        textposition="top center",
+        textfont=dict(size=10, color="#e5e5e5"),
+        hovertext=list(G.nodes()),
+        hoverinfo="text",
+        marker=dict(
+            size=sizes,
+            color=colors,
+            line=dict(width=1.2, color="rgba(255,255,255,0.35)"),
+        ),
+        showlegend=False,
+    )
+
+    fig = go.Figure(data=[edge_trace, node_trace])
+    fig.update_layout(
+        template="plotly_dark",
+        title=dict(
+            text=(
+                "Synthetic local network — high-risk exposure"
+                if is_threat
+                else "Synthetic local network — venue / retail flow"
+            ),
+            font=dict(size=14, color="#e5e5e5"),
+        ),
+        paper_bgcolor="#121212",
+        plot_bgcolor="#121212",
+        xaxis=dict(visible=False, scaleanchor="y", scaleratio=1),
+        yaxis=dict(visible=False),
+        margin=dict(l=24, r=24, t=56, b=24),
+        showlegend=False,
+        height=520,
+        hovermode="closest",
+    )
+    return fig
 
 
 def _report_address_suffix(address: str) -> str:
@@ -1080,6 +1226,17 @@ def _render_live_threat_tab(agent: ThreatDetectionAgent, names: list[str]) -> No
                     height=480,
                 )
                 st.plotly_chart(fig_r, use_container_width=True)
+
+        addr_for_graph = str(snap.get("wallet_address") or "")
+        is_threat_graph = v != "SAFE"
+        st.markdown("### 🕸️ Transaction Trace Graph (Local Network)")
+        st.caption(
+            "Illustrative *follow-the-money* style graph (synthetic layout for demos; not live chain data)."
+        )
+        st.plotly_chart(
+            generate_network_graph(addr_for_graph, is_threat=is_threat_graph),
+            use_container_width=True,
+        )
 
         try:
             pdf_bytes = generate_pdf_report(

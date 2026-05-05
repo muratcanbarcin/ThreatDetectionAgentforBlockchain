@@ -1,4 +1,5 @@
 pandas
+networkx
 matplotlib
 scikit-learn
 joblib
