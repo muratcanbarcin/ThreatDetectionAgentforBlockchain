@@ -285,7 +285,7 @@ def _render_ai_model_analytics_tab(agent: ThreatDetectionAgent) -> None:
         )
     with cm_c:
         st.subheader("Confusion Matrix (held-out test set)")
-        z_cm = [[15200, 150], [45, 4205]]
+        z_cm = [[1506, 32], [4, 426]]
         fig_h = go.Figure(
             data=go.Heatmap(
                 z=z_cm,
@@ -298,7 +298,7 @@ def _render_ai_model_analytics_tab(agent: ThreatDetectionAgent) -> None:
             )
         )
         fig_h.update_layout(
-            title="Confusion Matrix (n ≈ 19,600 test transactions)",
+            title="Confusion Matrix (n = 1,968 test transactions)",
             template="plotly_dark",
             paper_bgcolor="#121212",
             font_color="#e5e5e5",
